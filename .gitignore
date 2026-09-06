@@ -1,0 +1,22 @@
+# dependencies
+/node_modules
+/.pnpm-store
+
+# Next.js
+/.next
+/out
+
+# local secrets
+.env*
+!.env.example
+/.higgsfield/
+
+# tests and tooling
+/coverage
+.playwright-cli/
+/output/playwright/
+*.tsbuildinfo
+
+# OS/editor files
+.DS_Store
+*.log

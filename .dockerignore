@@ -1,0 +1,17 @@
+.git
+.next
+.playwright-cli
+node_modules
+output
+coverage
+
+.env
+.env.*
+!.env.example
+.higgsfield
+
+.DS_Store
+*.log
+*.tsbuildinfo
+
+README.md

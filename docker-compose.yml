@@ -1,0 +1,28 @@
+name: one-shot-video-studio
+
+services:
+  studio:
+    image: one-shot-video-studio:local
+    build:
+      context: .
+      target: runner
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      HIGGSFIELD_CLI_PATH: /usr/local/bin/higgsfield
+      HIGGSFIELD_CREDENTIALS_PATH: /home/nextjs/.higgsfield/credentials.json
+      HIGGSFIELD_CONFIG_PATH: /home/nextjs/.higgsfield/config.json
+      HIGGSFIELD_IMAGE_MODEL: "${HIGGSFIELD_IMAGE_MODEL:-gpt_image_2}"
+      HIGGSFIELD_VIDEO_MODEL: "${HIGGSFIELD_VIDEO_MODEL:-seedance_2_0}"
+      HIGGSFIELD_MOCK_MODE: "${HIGGSFIELD_MOCK_MODE:-false}"
+      HIGGSFIELD_NO_UPDATE_CHECK: "1"
+      FFMPEG_PATH: /usr/bin/ffmpeg
+      FFPROBE_PATH: /usr/bin/ffprobe
+    volumes:
+      - "${HOME}/.higgsfield:/home/nextjs/.higgsfield"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    stop_grace_period: 330s
