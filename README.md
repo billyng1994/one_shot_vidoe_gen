@@ -69,7 +69,7 @@ The image includes Node.js, Higgsfield CLI 1.1.24, FFmpeg, `ffprobe`, and Noto C
 docker compose --env-file .env.local up --build
 ```
 
-Open [http://localhost:3000](http://localhost:3000). The port is bound to localhost because these routes can spend account credits.
+Open [http://localhost](http://localhost). Docker maps host port 80 to the app's internal port 3000. On a server, protect the app with authentication because its generation routes can spend account credits.
 
 Stop the container with:
 

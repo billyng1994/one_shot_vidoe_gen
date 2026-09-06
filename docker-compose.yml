@@ -7,7 +7,7 @@ services:
       context: .
       target: runner
     ports:
-      - "127.0.0.1:3000:3000"
+      - "80:3000"
     environment:
       HIGGSFIELD_CLI_PATH: /usr/local/bin/higgsfield
       HIGGSFIELD_CREDENTIALS_PATH: /home/nextjs/.higgsfield/credentials.json
