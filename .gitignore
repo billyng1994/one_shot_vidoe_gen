@@ -5,6 +5,8 @@
 # Next.js
 /.next
 /out
+/backend/dist
+/backend/data
 
 # local secrets
 .env*
@@ -13,6 +15,7 @@
 
 # tests and tooling
 /coverage
+/backend/coverage
 .playwright-cli/
 /output/playwright/
 *.tsbuildinfo

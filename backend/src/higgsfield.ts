@@ -171,12 +171,39 @@ function getCliPath() {
 }
 
 function getCliEnvironment() {
-  const environment = { ...process.env };
-
-  // REST credentials are not required by the OAuth CLI subprocess.
-  delete environment.HF_API_KEY_ID;
-  delete environment.HF_API_KEY_SECRET;
-  delete environment.HIGGSFIELD_API_BASE_URL;
+  const environment: NodeJS.ProcessEnv = {};
+  const allowedKeys = [
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LOGNAME",
+    "NO_PROXY",
+    "PATH",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "TMPDIR",
+    "USER",
+    "XDG_CONFIG_HOME",
+    "all_proxy",
+    "http_proxy",
+    "https_proxy",
+    "ALL_PROXY",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+  ];
+  for (const key of allowedKeys) {
+    if (process.env[key] !== undefined) environment[key] = process.env[key];
+  }
+  for (const [key, value] of Object.entries(process.env)) {
+    if (
+      key.startsWith("HIGGSFIELD_") &&
+      key !== "HIGGSFIELD_API_BASE_URL" &&
+      key !== "HIGGSFIELD_CLI_PATH" &&
+      key !== "HIGGSFIELD_MOCK_MODE"
+    ) {
+      environment[key] = value;
+    }
+  }
   environment.HIGGSFIELD_NO_UPDATE_CHECK = "1";
 
   return environment;
@@ -361,7 +388,7 @@ function parseCreateOutput(stdout: string, model: string) {
 
   const jobIds = [...new Set(stdout.match(JOB_ID_TOKEN_PATTERN) ?? [])];
   if (jobIds.length === 1) {
-    return createJob(jobIds[0]);
+    return createJob(jobIds[0]!);
   }
 
   throw new HiggsfieldError(
@@ -452,6 +479,8 @@ async function recoverRecentJob(
       const params = nestedRecord(job.params);
       const createdAt =
         typeof job.created_at === "string" ? Date.parse(job.created_at) : Number.NaN;
+      const resultUrl = extractResultUrl(job);
+      const status = normalizeStatus(job.status ?? job.state, Boolean(resultUrl));
       return (
         matchesModel(job, input.model) &&
         params?.prompt === input.prompt &&
@@ -461,6 +490,7 @@ async function recoverRecentJob(
         (input.mode === undefined || params?.mode === input.mode) &&
         (input.resolution === undefined || params?.resolution === input.resolution) &&
         (input.sourceJobId === undefined || usesSourceImage(job, input.sourceJobId)) &&
+        (status === "queued" || status === "in_progress" || (status === "completed" && Boolean(resultUrl))) &&
         Number.isFinite(createdAt) &&
         createdAt >= input.notBefore &&
         createdAt <= now + 30_000
@@ -584,8 +614,8 @@ export function parsePublicRequestId(requestId: string) {
   }
 
   return {
-    kind: match[1].toLowerCase() as GenerationKind,
-    jobId: match[2],
+    kind: match[1]!.toLowerCase() as GenerationKind,
+    jobId: match[2]!,
   };
 }
 
@@ -644,7 +674,7 @@ async function preflightModel(model: string, runner: CliRunner, signal?: AbortSi
       : [
           "prompt",
           "aspect_ratio",
-          ...IMAGE_MODEL_OPTIONS[model]
+          ...IMAGE_MODEL_OPTIONS[model]!
             .filter((_, index) => index % 2 === 0)
             .map((flag) => flag.replace(/^--/, "").replaceAll("-", "_")),
         ];
@@ -699,6 +729,7 @@ export async function findRecentHiggsfieldImage(
   await requireCliAuthentication(runner, options.signal);
   const job = await recoverRecentJob(
     {
+      aspectRatio: "1:1",
       kind: "image",
       model,
       notBefore: Date.now() - 30 * 60_000,
@@ -757,7 +788,7 @@ export async function submitHiggsfieldImage(
   const model = getImageModel();
   await preflightModel(model, runner, options.signal);
 
-  const modelOptions = IMAGE_MODEL_OPTIONS[model];
+  const modelOptions = IMAGE_MODEL_OPTIONS[model]!;
   const submittedAt = Date.now();
 
   const result = await runner(
@@ -776,7 +807,7 @@ export async function submitHiggsfieldImage(
 
   const job = await resolveCreatedJob(
     result.stdout,
-    { kind: "image", model, prompt, submittedAt },
+    { aspectRatio: "1:1", kind: "image", model, prompt, submittedAt },
     runner,
     options.signal,
   );

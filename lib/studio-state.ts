@@ -37,12 +37,18 @@ function finiteNumber(value: unknown, fallback: number) {
 
 function safeRequestId(value: unknown, kind: "image" | "video") {
   if (typeof value !== "string") return "";
+  const backendPattern = new RegExp(
+    `^gen-${kind}-[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`,
+    "i",
+  );
   const cliPattern = new RegExp(
     `^cli-${kind}-[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`,
     "i",
   );
   const demoPattern = new RegExp(`^demo-${kind}-\\d+$`);
-  return cliPattern.test(value) || demoPattern.test(value) ? value : "";
+  return backendPattern.test(value) || cliPattern.test(value) || demoPattern.test(value)
+    ? value
+    : "";
 }
 
 function safeMediaUrl(value: unknown) {

@@ -8,6 +8,7 @@ import {
 
 const IMAGE_ID = "cli-image-12345678-1234-4234-8234-123456789012";
 const VIDEO_ID = "cli-video-87654321-4321-4321-8321-210987654321";
+const BACKEND_IMAGE_ID = "gen-image-12345678-1234-4234-8234-123456789012";
 
 describe("studio state persistence", () => {
   it("round-trips generated assets and editor settings", () => {
@@ -44,6 +45,21 @@ describe("studio state persistence", () => {
       image: { requestId: "", url: "" },
       video: { requestId: VIDEO_ID, url: "" },
       title: { x: 0.02, y: 0.84, fontSize: 132 },
+    });
+  });
+
+  it("accepts opaque generation IDs issued by the backend", () => {
+    const restored = parseStudioSnapshot(
+      JSON.stringify({
+        version: 1,
+        step: 2,
+        image: { requestId: BACKEND_IMAGE_ID, url: "/media/projects/demo/image.png" },
+      }),
+    );
+
+    expect(restored?.image).toEqual({
+      requestId: BACKEND_IMAGE_ID,
+      url: "/media/projects/demo/image.png",
     });
   });
 

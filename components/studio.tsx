@@ -44,9 +44,11 @@ import {
   type TitlePlacement,
 } from "@/lib/composition";
 import type {
+  BackendHealth,
   GenerationRequest,
   GenerationStatus,
-} from "@/lib/higgsfield";
+  RenderResponse,
+} from "@/lib/api-types";
 import {
   type PersistedAsset,
   type StudioSnapshot,
@@ -66,18 +68,6 @@ import {
 type Step = 1 | 2 | 3;
 type JobPhase = "idle" | "submitting" | GenerationStatus | "error";
 type JobState = { phase: JobPhase; message?: string };
-type Health = {
-  configured: boolean;
-  mockMode: boolean;
-  provider: string;
-  cli: {
-    installed: boolean;
-    authenticated: boolean;
-    version?: string;
-  };
-  models: { image: string; video: string };
-};
-
 const IMAGE_IDEAS = [
   "A warm documentary portrait in soft morning light",
   "A joyful family reunion, cinematic natural light",
@@ -301,12 +291,17 @@ function JobMessage({ job }: { job: JobState }) {
   );
 }
 
-function CredentialNotice({ health }: { health: Health | null }) {
+function CredentialNotice({ health }: { health: BackendHealth | null }) {
   if (!health || health.configured || health.mockMode) return null;
 
-  const message = health.cli.installed
-    ? "Run `higgsfield auth login` on the host, then restart the container."
-    : "Install the Higgsfield CLI, authenticate it, then restart the app.";
+  const message = !health.storage.writable
+    ? "Make BACKEND_DATA_DIR writable on the backend host, then restart the service."
+    : health.cli.installed
+      ? "Run `higgsfield auth login` on the backend host, then restart the backend."
+      : "Install the Higgsfield CLI on the backend, authenticate it, then restart the service.";
+  const title = health.storage.writable
+    ? "Connect Higgsfield to generate"
+    : "Backend storage is unavailable";
 
   return (
     <div className="credential-notice">
@@ -314,7 +309,7 @@ function CredentialNotice({ health }: { health: Health | null }) {
         <KeyRound size={18} />
       </div>
       <div>
-        <strong>Connect Higgsfield to generate</strong>
+        <strong>{title}</strong>
         <p>{message}</p>
       </div>
     </div>
@@ -337,7 +332,7 @@ function EmptyArtwork({ kind }: { kind: "image" | "video" }) {
 export function Studio({ initialProjectId }: { initialProjectId: string }) {
   const router = useRouter();
   const [step, setStep] = useState<Step>(1);
-  const [health, setHealth] = useState<Health | null>(null);
+  const [health, setHealth] = useState<BackendHealth | null>(null);
   const [imagePrompt, setImagePrompt] = useState("");
   const [motionPrompt, setMotionPrompt] = useState("");
   const [imageUrl, setImageUrl] = useState("");
@@ -374,7 +369,7 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
   } | null>(null);
 
   useEffect(() => {
-    jsonRequest<Health>("/api/health", { cache: "no-store" })
+    jsonRequest<BackendHealth>("/api/health", { cache: "no-store" })
       .then(setHealth)
       .catch(() => setHealth(null));
   }, []);
@@ -748,6 +743,9 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
     setHydratedProjectId("");
     setActiveProjectId(nextActiveProjectId);
     router.replace(`/projects/${nextActiveProjectId}`, { scroll: false });
+    void fetch(`/api/projects/${encodeURIComponent(project.id)}/media`, {
+      method: "DELETE",
+    });
   };
 
   const generateImage = async () => {
@@ -766,7 +764,7 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
       const initial = await jsonRequest<GenerationRequest>("/api/generations/image", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: imagePrompt }),
+        body: JSON.stringify({ projectId: activeProjectId, prompt: imagePrompt }),
       });
       setImageRequestId(initial.request_id);
       setImageJob({ phase: initial.status });
@@ -799,6 +797,7 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          projectId: activeProjectId,
           prompt: motionPrompt,
           imageRequestId,
           duration,
@@ -825,9 +824,9 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
   const loadSample = () => {
     setImagePrompt("A hopeful traveler at sunset, warm editorial photography");
     setMotionPrompt("A gentle cinematic push-in with a natural breeze");
-    setImageUrl("/demo/demo-image.svg");
+    setImageUrl("/media/samples/demo-image.svg");
     setImageRequestId("");
-    setVideoUrl("/demo/demo-video.mp4");
+    setVideoUrl("/media/samples/demo-video.mp4");
     setVideoRequestId("");
     setImageJob({ phase: "completed" });
     setVideoJob({ phase: "completed" });
@@ -916,6 +915,7 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
     setRenderJob({ phase: "in_progress" });
     try {
       const form = new FormData();
+      form.append("projectId", activeProjectId);
       form.append("videoUrl", videoUrl);
       form.append("title", title.text);
       form.append("titleX", String(title.x));
@@ -930,13 +930,14 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
         throw new Error(body?.error ?? "The final MP4 could not be rendered.");
       }
 
-      const blob = await response.blob();
-      const downloadUrl = URL.createObjectURL(blob);
+      const result = (await response.json()) as RenderResponse;
+      if (!result.url || !result.filename) {
+        throw new Error("The backend did not return a saved render.");
+      }
       const link = document.createElement("a");
-      link.href = downloadUrl;
-      link.download = `one-shot-${new Date().toISOString().slice(0, 10)}.mp4`;
+      link.href = result.url;
+      link.download = result.filename;
       link.click();
-      window.setTimeout(() => URL.revokeObjectURL(downloadUrl), 2_000);
       setRenderJob({ phase: "completed" });
     } catch (error) {
       setRenderJob({
@@ -1006,6 +1007,8 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
             ? "Demo API"
             : health?.configured
               ? "Higgsfield CLI ready"
+              : health && !health.storage.writable
+                ? "Storage unavailable"
               : health
                 ? "CLI login needed"
                 : "Checking CLI"}
@@ -1098,7 +1101,7 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
               </div>
               <div className="image-stage">
                 {imageUrl ? (
-                  // Provider URLs are dynamic, so a native image element is intentional here.
+                  // Backend media URLs are dynamic, so a native image element is intentional here.
                   // eslint-disable-next-line @next/next/no-img-element
                   <img alt="Generated first frame" src={imageUrl} />
                 ) : imageBusy ? (

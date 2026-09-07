@@ -1,17 +1,27 @@
 name: one-shot-video-studio
 
 services:
-  studio:
-    image: one-shot-video-studio:local
+  backend:
+    image: one-shot-video-backend:local
     build:
       context: .
-      target: runner
-    ports:
-      - "80:3000"
+      target: backend-runner
     environment:
+      BACKEND_HOST: 0.0.0.0
+      BACKEND_PORT: 4000
+      BACKEND_DATA_DIR: /data
+      BACKEND_CORS_ORIGIN: "${BACKEND_CORS_ORIGIN:-}"
+      BACKEND_MAX_CLI_CONCURRENCY: "${BACKEND_MAX_CLI_CONCURRENCY:-2}"
+      BACKEND_MAX_RENDER_CONCURRENCY: "${BACKEND_MAX_RENDER_CONCURRENCY:-1}"
+      BACKEND_MAX_IMAGE_BYTES: "${BACKEND_MAX_IMAGE_BYTES:-31457280}"
+      BACKEND_MAX_VIDEO_BYTES: "${BACKEND_MAX_VIDEO_BYTES:-262144000}"
+      BACKEND_MAX_MUSIC_BYTES: "${BACKEND_MAX_MUSIC_BYTES:-41943040}"
+      BACKEND_POLL_INITIAL_DELAY_MS: "${BACKEND_POLL_INITIAL_DELAY_MS:-2000}"
+      BACKEND_POLL_MAX_DELAY_MS: "${BACKEND_POLL_MAX_DELAY_MS:-10000}"
+      BACKEND_POLL_WINDOW_MS: "${BACKEND_POLL_WINDOW_MS:-720000}"
       HIGGSFIELD_CLI_PATH: /usr/local/bin/higgsfield
-      HIGGSFIELD_CREDENTIALS_PATH: /home/nextjs/.higgsfield/credentials.json
-      HIGGSFIELD_CONFIG_PATH: /home/nextjs/.higgsfield/config.json
+      HIGGSFIELD_CREDENTIALS_PATH: /home/backend/.higgsfield/credentials.json
+      HIGGSFIELD_CONFIG_PATH: /home/backend/.higgsfield/config.json
       HIGGSFIELD_IMAGE_MODEL: "${HIGGSFIELD_IMAGE_MODEL:-gpt_image_2}"
       HIGGSFIELD_VIDEO_MODEL: "${HIGGSFIELD_VIDEO_MODEL:-seedance_2_0}"
       HIGGSFIELD_MOCK_MODE: "${HIGGSFIELD_MOCK_MODE:-false}"
@@ -19,10 +29,34 @@ services:
       FFMPEG_PATH: /usr/bin/ffmpeg
       FFPROBE_PATH: /usr/bin/ffprobe
     volumes:
-      - "${HOME}/.higgsfield:/home/nextjs/.higgsfield"
+      - "${HOME}/.higgsfield:/home/backend/.higgsfield"
+      - backend-data:/data
+    expose:
+      - "4000"
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
     restart: unless-stopped
     stop_grace_period: 330s
+
+  studio:
+    image: one-shot-video-frontend:local
+    build:
+      context: .
+      target: frontend-runner
+      args:
+        BACKEND_URL: http://backend:4000
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "80:3000"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+volumes:
+  backend-data:

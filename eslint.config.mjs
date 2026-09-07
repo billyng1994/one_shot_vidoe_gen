@@ -5,5 +5,12 @@ import nextTypescript from "eslint-config-next/typescript";
 export default defineConfig([
   ...nextVitals,
   ...nextTypescript,
-  globalIgnores([".next/**", "coverage/**", "public/demo/*.mp4"]),
+  globalIgnores([
+    ".next/**",
+    "backend/coverage/**",
+    "backend/data/**",
+    "backend/dist/**",
+    "coverage/**",
+    "public/demo/*.mp4",
+  ]),
 ]);

@@ -31,23 +31,49 @@ RUN apt-get update \
 FROM base AS dependencies
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY backend/package.json ./backend/package.json
 RUN pnpm install --frozen-lockfile
 
-FROM dependencies AS checks
+FROM dependencies AS build
 
-COPY . .
-RUN pnpm lint && pnpm typecheck && pnpm test
-
-FROM base AS builder
-
+ARG BACKEND_URL=http://backend:4000
+ENV BACKEND_URL=$BACKEND_URL
 ENV NEXT_TELEMETRY_DISABLED=1
 
-COPY --from=dependencies /app/node_modules ./node_modules
 COPY . .
+RUN pnpm check
 
-RUN pnpm build
+FROM node:22-bookworm-slim AS frontend-runner
 
-FROM node:22-bookworm-slim AS runner
+RUN apt-get update \
+  && apt-get install --yes --no-install-recommends ca-certificates dumb-init \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV HOSTNAME=0.0.0.0
+ENV PORT=3000
+
+RUN groupadd --system --gid 1001 nodejs \
+  && useradd --system --uid 1001 --gid nodejs nextjs
+
+COPY --from=build --chown=nextjs:nodejs /app/public ./public
+COPY --from=build --chown=nextjs:nodejs /app/.next/standalone ./
+COPY --from=build --chown=nextjs:nodejs /app/.next/static ./.next/static
+
+USER nextjs
+
+EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:3000/api/health?check=liveness').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
+ENTRYPOINT ["dumb-init", "--"]
+CMD ["node", "server.js"]
+
+FROM node:22-bookworm-slim AS backend-runner
 
 RUN apt-get update \
   && apt-get install --yes --no-install-recommends \
@@ -60,34 +86,36 @@ RUN apt-get update \
 WORKDIR /app
 
 ENV NODE_ENV=production
-ENV NEXT_TELEMETRY_DISABLED=1
-ENV HOSTNAME=0.0.0.0
-ENV PORT=3000
+ENV BACKEND_HOST=0.0.0.0
+ENV BACKEND_PORT=4000
+ENV BACKEND_DATA_DIR=/data
 ENV FFMPEG_PATH=/usr/bin/ffmpeg
 ENV FFPROBE_PATH=/usr/bin/ffprobe
 ENV HIGGSFIELD_CLI_PATH=/usr/local/bin/higgsfield
-ENV HIGGSFIELD_CREDENTIALS_PATH=/home/nextjs/.higgsfield/credentials.json
-ENV HIGGSFIELD_CONFIG_PATH=/home/nextjs/.higgsfield/config.json
+ENV HIGGSFIELD_CREDENTIALS_PATH=/home/backend/.higgsfield/credentials.json
+ENV HIGGSFIELD_CONFIG_PATH=/home/backend/.higgsfield/config.json
 ENV HIGGSFIELD_NO_UPDATE_CHECK=1
 
 RUN groupadd --system --gid 1001 nodejs \
-  && useradd --system --uid 1001 --gid nodejs --create-home nextjs \
-  && mkdir --parents /home/nextjs/.higgsfield \
-  && chown --recursive nextjs:nodejs /home/nextjs/.higgsfield
+  && useradd --system --uid 1001 --gid nodejs --create-home backend \
+  && mkdir --parents /home/backend/.higgsfield /data \
+  && chown --recursive backend:nodejs /home/backend/.higgsfield /data
 
 COPY --from=higgsfield-cli /usr/local/bin/higgsfield /usr/local/bin/higgsfield
 RUN higgsfield version
 
-COPY --from=builder --chown=nextjs:nodejs /app/public ./public
-COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
-COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+COPY --from=dependencies --chown=backend:nodejs /app/node_modules ./node_modules
+COPY --from=dependencies --chown=backend:nodejs /app/backend/node_modules ./backend/node_modules
+COPY --from=build --chown=backend:nodejs /app/backend/dist ./backend/dist
+COPY --from=build --chown=backend:nodejs /app/backend/assets ./backend/assets
+COPY --from=build --chown=backend:nodejs /app/backend/package.json ./backend/package.json
 
-USER nextjs
+USER backend
 
-EXPOSE 3000
+EXPOSE 4000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:3000/api/health?check=liveness').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+  CMD node -e "fetch('http://127.0.0.1:4000/api/health?check=liveness').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
 ENTRYPOINT ["dumb-init", "--"]
-CMD ["node", "server.js"]
+CMD ["node", "backend/dist/server.js"]

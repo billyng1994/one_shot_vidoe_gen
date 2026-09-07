@@ -4,6 +4,9 @@
 node_modules
 output
 coverage
+backend/data
+backend/dist
+backend/coverage
 
 .env
 .env.*

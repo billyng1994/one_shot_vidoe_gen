@@ -3,25 +3,31 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start",
+    "dev": "concurrently --kill-others --names frontend,backend \"pnpm dev:frontend\" \"pnpm dev:backend\"",
+    "dev:frontend": "next dev",
+    "dev:backend": "pnpm --dir backend dev",
+    "build": "pnpm build:frontend && pnpm build:backend",
+    "build:frontend": "next build",
+    "build:backend": "pnpm --dir backend build",
+    "start": "concurrently --kill-others --names frontend,backend \"pnpm start:frontend\" \"pnpm start:backend\"",
+    "start:frontend": "next start",
+    "start:backend": "pnpm --dir backend start",
     "lint": "eslint .",
-    "typecheck": "tsc --noEmit",
-    "test": "vitest run",
+    "typecheck": "tsc --noEmit && pnpm --dir backend typecheck",
+    "test": "vitest run && pnpm --dir backend test",
     "check": "pnpm lint && pnpm typecheck && pnpm test && pnpm build"
   },
   "dependencies": {
     "lucide-react": "^0.542.0",
     "next": "16.3.4",
     "react": "19.2.8",
-    "react-dom": "19.2.8",
-    "sharp": "^0.34.3"
+    "react-dom": "19.2.8"
   },
   "devDependencies": {
     "@types/node": "^24.3.0",
     "@types/react": "^19.1.12",
     "@types/react-dom": "^19.1.9",
+    "concurrently": "^9.2.1",
     "eslint": "^9.34.0",
     "eslint-config-next": "16.3.4",
     "typescript": "^5.9.2",

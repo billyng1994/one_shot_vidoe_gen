@@ -108,7 +108,7 @@ export function ProjectDashboard() {
           <span>OneTake</span>
         </Link>
         <span className="local-workspace-pill">
-          <FolderOpen size={14} /> Stored in this browser
+          <FolderOpen size={14} /> Media stored on backend
         </span>
       </header>
 
@@ -167,7 +167,7 @@ export function ProjectDashboard() {
                       <Sparkles aria-hidden="true" size={15} />
                     </div>
                     {project.snapshot.image.url ? (
-                      // Provider URLs are dynamic, so a native image element is intentional.
+                      // Backend media URLs are dynamic, so a native image element is intentional.
                       // eslint-disable-next-line @next/next/no-img-element
                       <img
                         alt=""
