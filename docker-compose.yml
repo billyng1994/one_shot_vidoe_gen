@@ -36,7 +36,7 @@ services:
       FFMPEG_PATH: /usr/bin/ffmpeg
       FFPROBE_PATH: /usr/bin/ffprobe
     volumes:
-      - "${HOME}/.higgsfield:/home/backend/.higgsfield"
+      - higgsfield-auth:/home/backend/.higgsfield
       - backend-data:/data
     expose:
       - "4000"
@@ -69,3 +69,6 @@ services:
 
 volumes:
   backend-data:
+  higgsfield-auth:
+    # Keep this stable: the documented one-off OAuth container mounts it by name.
+    name: one-shot-video-studio_higgsfield-auth

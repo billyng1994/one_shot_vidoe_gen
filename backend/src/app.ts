@@ -33,6 +33,7 @@ import { JobStore } from "./job-store.js";
 import { createMediaHandler } from "./media-handler.js";
 import { MediaStorage } from "./media-storage.js";
 import { ProjectService } from "./project-store.js";
+import { ProviderManagementService } from "./provider-management.js";
 import { RenderService } from "./render-service.js";
 import { assertProjectId, parseBackendRequestId, validatePrompt } from "./validation.js";
 
@@ -43,6 +44,7 @@ type AppDependencies = {
   jobs: JobStore;
   media: MediaStorage;
   projects: ProjectService;
+  providerManagement: ProviderManagementService;
   renders: RenderService;
 };
 
@@ -206,7 +208,16 @@ function sessionPayload(
 }
 
 export function createApp(dependencies: AppDependencies): Express {
-  const { auth, config, generations, jobs, media, projects, renders } = dependencies;
+  const {
+    auth,
+    config,
+    generations,
+    jobs,
+    media,
+    projects,
+    providerManagement,
+    renders,
+  } = dependencies;
   const app = express();
   const cookieConfig: SessionCookieConfig = {
     name: config.authCookieSecure ? "__Host-onetake_session" : "onetake_session",
@@ -529,6 +540,15 @@ export function createApp(dependencies: AppDependencies): Express {
   );
 
   app.get(
+    "/api/admin/provider",
+    requireAdministrator,
+    asyncRoute(async (_request, response) => {
+      response.set("Cache-Control", "private, no-store");
+      response.json(await providerManagement.status());
+    }),
+  );
+
+  app.get(
     "/api/admin/users",
     requireAdministrator,
     asyncRoute(async (_request, response) => {
@@ -635,6 +655,7 @@ export type BackendRuntime = {
   jobs: JobStore;
   media: MediaStorage;
   projects: ProjectService;
+  providerManagement: ProviderManagementService;
   renders: RenderService;
   initialize(): Promise<void>;
 };
@@ -665,6 +686,7 @@ export function createBackendRuntime(
     },
     options.provider,
   );
+  const providerManagement = new ProviderManagementService(generations);
   const renders = new RenderService(media, config.assetsDir, {
     concurrency: config.maxRenderConcurrency,
     ffmpegPath: config.ffmpegPath,
@@ -673,12 +695,22 @@ export function createBackendRuntime(
     maxVideoBytes: config.maxVideoBytes,
   });
   return {
-    app: createApp({ auth, config, generations, jobs, media, projects, renders }),
+    app: createApp({
+      auth,
+      config,
+      generations,
+      jobs,
+      media,
+      projects,
+      providerManagement,
+      renders,
+    }),
     auth,
     generations,
     jobs,
     media,
     projects,
+    providerManagement,
     renders,
     async initialize() {
       await Promise.all([auth.initialize(), projects.initialize(), generations.initialize()]);

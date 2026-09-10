@@ -112,6 +112,9 @@ describe("Express backend API", () => {
       .get("/api/health")
       .expect(401, { error: "Authentication is required.", code: "AUTH_REQUIRED" });
     await request(runtime.app)
+      .get("/api/admin/provider")
+      .expect(401, { error: "Authentication is required.", code: "AUTH_REQUIRED" });
+    await request(runtime.app)
       .get("/api/auth/session")
       .expect(200)
       .expect(({ body }) => expect(body).toEqual({
@@ -148,6 +151,30 @@ describe("Express backend API", () => {
       csrfToken: bootstrapSession.csrfToken,
     });
     expect(authenticatedSession.headers["cache-control"]).toContain("no-store");
+
+    const providerStatus = await adminAgent.get("/api/admin/provider").expect(200);
+    expect(providerStatus.body).toEqual({
+      provider: "Higgsfield CLI",
+      configured: true,
+      mockMode: true,
+      cli: { installed: true, authenticated: true, version: "demo" },
+      storage: { writable: true },
+      models: { image: "GPT Image 2", video: "Seedance 2.0" },
+      connection: {
+        kind: "ssh-loopback",
+        callbackPort: 18_765,
+        tunnelCommand: "ssh -L 18765:127.0.0.1:18765 <vm-user>@<vm-host>",
+        command:
+          "docker run --rm -it --network host --mount source=one-shot-video-studio_higgsfield-auth,target=/home/backend/.higgsfield --entrypoint /usr/local/bin/higgsfield one-shot-video-backend:local auth login --port 18765",
+        description:
+          "Open the SSH tunnel from your computer, then run the server command and complete login in your local browser.",
+      },
+    });
+    expect(providerStatus.headers["cache-control"]).toBe("private, no-store");
+    const serializedProviderStatus = JSON.stringify(providerStatus.body);
+    expect(serializedProviderStatus).not.toContain(PASSWORD);
+    expect(serializedProviderStatus).not.toContain(SETUP_TOKEN);
+    expect(serializedProviderStatus).not.toMatch(/(?:access|refresh)[_-]?token|credentials\.json/iu);
 
     await browserMutation(adminAgent.post("/api/projects"))
       .send({ name: "Missing CSRF" })
@@ -241,6 +268,9 @@ describe("Express backend API", () => {
     const memberCsrf = memberLogin.body.csrfToken as string;
     await memberAgent
       .get("/api/admin/users")
+      .expect(403, { error: "Administrator access is required.", code: "ADMIN_REQUIRED" });
+    await memberAgent
+      .get("/api/admin/provider")
       .expect(403, { error: "Administrator access is required.", code: "ADMIN_REQUIRED" });
     await memberAgent
       .get(`/api/projects/${projectId}`)

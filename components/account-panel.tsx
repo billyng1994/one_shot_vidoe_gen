@@ -5,13 +5,20 @@ import {
   Ban,
   CheckCircle2,
   Clock3,
+  Copy,
+  Cpu,
+  HardDrive,
   KeyRound,
   LoaderCircle,
   LogOut,
   RefreshCw,
+  Server,
   ShieldCheck,
+  Terminal,
   UserPlus,
   Users,
+  Wifi,
+  WifiOff,
   X,
 } from "lucide-react";
 import {
@@ -20,6 +27,7 @@ import {
   useEffect,
   useId,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import { createPortal } from "react-dom";
@@ -31,7 +39,32 @@ type AccountPanelProps = {
   onClose: () => void;
 };
 
-type PanelTab = "account" | "users" | "audit";
+type PanelTab = "account" | "users" | "provider" | "audit";
+
+type ProviderAdminStatus = {
+  provider: "Higgsfield CLI";
+  configured: boolean;
+  mockMode: boolean;
+  cli: {
+    installed: boolean;
+    authenticated: boolean;
+    version?: string;
+  };
+  storage: {
+    writable: boolean;
+  };
+  models: {
+    image: string;
+    video: string;
+  };
+  connection: {
+    kind: "ssh-loopback";
+    callbackPort: number;
+    tunnelCommand: string;
+    command: string;
+    description: string;
+  };
+};
 
 type AuditRecord = {
   id: string;
@@ -70,6 +103,61 @@ function actionLabel(value: string) {
     .replace(/^admin\.|^auth\./u, "")
     .replaceAll("_", " ")
     .replace(/^\w/u, (character) => character.toUpperCase());
+}
+
+function parseProviderStatus(value: unknown): ProviderAdminStatus {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("The backend returned an invalid provider status.");
+  }
+  const candidate = value as Partial<ProviderAdminStatus>;
+  const cli = candidate.cli as Partial<ProviderAdminStatus["cli"]> | undefined;
+  const storage = candidate.storage as Partial<ProviderAdminStatus["storage"]> | undefined;
+  const models = candidate.models as Partial<ProviderAdminStatus["models"]> | undefined;
+  const connection = candidate.connection as Partial<ProviderAdminStatus["connection"]> | undefined;
+  if (
+    candidate.provider !== "Higgsfield CLI" ||
+    typeof candidate.configured !== "boolean" ||
+    typeof candidate.mockMode !== "boolean" ||
+    typeof cli?.installed !== "boolean" ||
+    typeof cli.authenticated !== "boolean" ||
+    (cli.version !== undefined && typeof cli.version !== "string") ||
+    typeof storage?.writable !== "boolean" ||
+    typeof models?.image !== "string" ||
+    typeof models.video !== "string" ||
+    connection?.kind !== "ssh-loopback" ||
+    typeof connection.callbackPort !== "number" ||
+    !Number.isSafeInteger(connection.callbackPort) ||
+    (connection.callbackPort ?? 0) < 1 ||
+    (connection.callbackPort ?? 0) > 65_535 ||
+    typeof connection.tunnelCommand !== "string" ||
+    connection.tunnelCommand.length === 0 ||
+    typeof connection.command !== "string" ||
+    connection.command.length === 0 ||
+    typeof connection.description !== "string"
+  ) {
+    throw new Error("The backend returned an invalid provider status.");
+  }
+  return candidate as ProviderAdminStatus;
+}
+
+async function copyToClipboard(value: string) {
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.append(textarea);
+  textarea.select();
+  try {
+    if (!document.execCommand("copy")) throw new Error("Copy was not accepted by the browser.");
+  } finally {
+    textarea.remove();
+  }
 }
 
 function UserEditor({
@@ -256,6 +344,15 @@ export function AccountPanel({ open, onClose }: AccountPanelProps) {
   const [profileBusy, setProfileBusy] = useState(false);
   const [passwordBusy, setPasswordBusy] = useState(false);
   const [accountError, setAccountError] = useState("");
+  const [providerStatus, setProviderStatus] = useState<ProviderAdminStatus | null>(null);
+  const [providerLoading, setProviderLoading] = useState(false);
+  const [providerError, setProviderError] = useState("");
+  const [copyState, setCopyState] = useState<{
+    target: "tunnel" | "login";
+    status: "copied" | "error";
+  } | null>(null);
+  const [showProviderGuide, setShowProviderGuide] = useState(false);
+  const providerGuideRef = useRef<HTMLDivElement>(null);
 
   const isAdmin = user?.role === "admin";
 
@@ -274,6 +371,21 @@ export function AccountPanel({ open, onClose }: AccountPanelProps) {
       setAdminError(messageFrom(cause, "User management could not be loaded."));
     } finally {
       setLoadingAdmin(false);
+    }
+  }, [isAdmin, request]);
+
+  const loadProviderStatus = useCallback(async () => {
+    if (!isAdmin) return;
+    setProviderLoading(true);
+    setProviderError("");
+    setCopyState(null);
+    try {
+      const response = await request<unknown>("/api/admin/provider", { cache: "no-store" });
+      setProviderStatus(parseProviderStatus(response));
+    } catch (cause) {
+      setProviderError(messageFrom(cause, "Provider status could not be checked."));
+    } finally {
+      setProviderLoading(false);
     }
   }, [isAdmin, request]);
 
@@ -424,6 +536,37 @@ export function AccountPanel({ open, onClose }: AccountPanelProps) {
     }
   };
 
+  const openProviderTab = () => {
+    setTab("provider");
+    if (!providerStatus && !providerLoading) void loadProviderStatus();
+  };
+
+  const copyProviderCommand = async (
+    target: "tunnel" | "login",
+    command: string,
+  ) => {
+    setCopyState(null);
+    try {
+      await copyToClipboard(command);
+      setCopyState({ target, status: "copied" });
+    } catch {
+      setCopyState({ target, status: "error" });
+    }
+  };
+
+  const revealProviderGuide = () => {
+    setShowProviderGuide(true);
+    window.requestAnimationFrame(() => providerGuideRef.current?.focus());
+  };
+
+  const providerConnected = providerStatus !== null &&
+    providerStatus.configured &&
+    providerStatus.storage.writable &&
+    (
+      providerStatus.mockMode ||
+      (providerStatus.cli.installed && providerStatus.cli.authenticated)
+    );
+
   if (!open || !user) return null;
 
   return createPortal(
@@ -476,6 +619,15 @@ export function AccountPanel({ open, onClose }: AccountPanelProps) {
                 type="button"
               >
                 <Users size={15} /> Users
+              </button>
+              <button
+                aria-selected={tab === "provider"}
+                className={tab === "provider" ? "is-active" : ""}
+                onClick={openProviderTab}
+                role="tab"
+                type="button"
+              >
+                <Server size={15} /> Provider
               </button>
               <button
                 aria-selected={tab === "audit"}
@@ -665,6 +817,218 @@ export function AccountPanel({ open, onClose }: AccountPanelProps) {
                   ))}
                 </div>
               )}
+            </section>
+          ) : null}
+
+          {tab === "provider" && isAdmin ? (
+            <section
+              aria-busy={providerLoading}
+              aria-live="polite"
+              className="account-provider"
+              role="tabpanel"
+            >
+              <div className="account-provider-heading">
+                <div className="account-section-heading">
+                  <span><Server size={17} /></span>
+                  <div>
+                    <h3>Higgsfield provider</h3>
+                    <p>Read-only connection status from the backend server.</p>
+                  </div>
+                </div>
+                <button
+                  className="account-secondary-button"
+                  disabled={providerLoading}
+                  onClick={() => void loadProviderStatus()}
+                  type="button"
+                >
+                  <RefreshCw className={providerLoading ? "spin" : ""} size={15} />
+                  {providerLoading ? "Checking…" : "Recheck connection"}
+                </button>
+              </div>
+
+              {providerError ? (
+                <div className="account-provider-error" role="alert">
+                  <AlertTriangle size={17} />
+                  <div><strong>Status check failed</strong><p>{providerError}</p></div>
+                </div>
+              ) : null}
+
+              {providerLoading && !providerStatus ? (
+                <div className="account-empty">
+                  <LoaderCircle className="spin" size={20} /> Checking Higgsfield…
+                </div>
+              ) : null}
+
+              {providerStatus ? (
+                <>
+                  <div className={`account-provider-state ${providerConnected ? "is-connected" : "is-disconnected"}`}>
+                    <span className="account-provider-state-icon">
+                      {providerConnected ? <Wifi size={20} /> : <WifiOff size={20} />}
+                    </span>
+                    <div>
+                      <span>HIGGSFIELD CLI</span>
+                      <strong>{providerConnected ? "Connected" : "Disconnected"}</strong>
+                      <p>
+                        {providerConnected
+                          ? "The backend is ready to run image and video generation."
+                          : "Review the checks below, then authenticate on the backend server."}
+                      </p>
+                    </div>
+                    <div className="account-provider-state-actions">
+                      {providerStatus.mockMode ? (
+                        <span className="account-provider-demo">Demo mode</span>
+                      ) : null}
+                      <button
+                        className={providerConnected
+                          ? "account-provider-guide-button"
+                          : "account-provider-connect-button"}
+                        onClick={revealProviderGuide}
+                        type="button"
+                      >
+                        <Terminal size={14} />
+                        {providerConnected ? "Show login guide" : "Connect Higgsfield"}
+                      </button>
+                    </div>
+                  </div>
+
+                  <dl className="account-provider-checks">
+                    <div>
+                      <dt><Terminal size={15} /> CLI installed</dt>
+                      <dd className={providerStatus.cli.installed ? "is-ok" : "is-error"}>
+                        {providerStatus.cli.installed ? "Installed" : "Not installed"}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt><ShieldCheck size={15} /> Authentication</dt>
+                      <dd className={providerStatus.cli.authenticated ? "is-ok" : "is-error"}>
+                        {providerStatus.cli.authenticated ? "Signed in" : "Sign-in required"}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt><Cpu size={15} /> CLI version</dt>
+                      <dd>{providerStatus.cli.version ?? "Not reported"}</dd>
+                    </div>
+                    <div>
+                      <dt><HardDrive size={15} /> Backend storage</dt>
+                      <dd className={providerStatus.storage.writable ? "is-ok" : "is-error"}>
+                        {providerStatus.storage.writable ? "Writable" : "Not writable"}
+                      </dd>
+                    </div>
+                  </dl>
+
+                  <div className="account-provider-models">
+                    <div className="account-section-heading">
+                      <span><Cpu size={17} /></span>
+                      <div><h3>Generation models</h3><p>Models reported by the backend adapter.</p></div>
+                    </div>
+                    <dl>
+                      <div><dt>Image</dt><dd>{providerStatus.models.image}</dd></div>
+                      <div><dt>Video</dt><dd>{providerStatus.models.video}</dd></div>
+                    </dl>
+                  </div>
+
+                  {showProviderGuide ? (
+                    <div
+                      className="account-provider-command"
+                      ref={providerGuideRef}
+                      tabIndex={-1}
+                    >
+                      <div className="account-section-heading">
+                        <span><Terminal size={17} /></span>
+                        <div><h3>Connect from the backend server</h3><p>{providerStatus.connection.description}</p></div>
+                      </div>
+                      <ol className="account-provider-steps">
+                        <li>
+                          <span className="account-provider-step-number">1</span>
+                          <div>
+                            <h4>Open the SSH tunnel locally</h4>
+                            <p>
+                              Run this on your computer and keep the SSH session open. It forwards
+                              the CLI callback on port {providerStatus.connection.callbackPort}.
+                            </p>
+                            <div className="account-command-box">
+                              <code>{providerStatus.connection.tunnelCommand}</code>
+                              <button
+                                aria-label="Copy SSH tunnel command"
+                                className="account-command-copy"
+                                onClick={() => void copyProviderCommand(
+                                  "tunnel",
+                                  providerStatus.connection.tunnelCommand,
+                                )}
+                                type="button"
+                              >
+                                {copyState?.target === "tunnel" && copyState.status === "copied"
+                                  ? <CheckCircle2 size={15} />
+                                  : <Copy size={15} />}
+                                {copyState?.target === "tunnel" && copyState.status === "copied"
+                                  ? "Copied"
+                                  : "Copy tunnel"}
+                              </button>
+                            </div>
+                          </div>
+                        </li>
+                        <li>
+                          <span className="account-provider-step-number">2</span>
+                          <div>
+                            <h4>Run the login command on the server</h4>
+                            <p>
+                              Run this in that SSH session. If Higgsfield prints an authorization
+                              URL, copy it into your local browser to finish signing in.
+                            </p>
+                            <div className="account-command-box">
+                              <code>{providerStatus.connection.command}</code>
+                              <button
+                                aria-label="Copy Higgsfield server login command"
+                                className="account-command-copy"
+                                onClick={() => void copyProviderCommand(
+                                  "login",
+                                  providerStatus.connection.command,
+                                )}
+                                type="button"
+                              >
+                                {copyState?.target === "login" && copyState.status === "copied"
+                                  ? <CheckCircle2 size={15} />
+                                  : <Copy size={15} />}
+                                {copyState?.target === "login" && copyState.status === "copied"
+                                  ? "Copied"
+                                  : "Copy login"}
+                              </button>
+                            </div>
+                          </div>
+                        </li>
+                        <li>
+                          <span className="account-provider-step-number">3</span>
+                          <div>
+                            <h4>Confirm the connection</h4>
+                            <p>After the CLI reports success, return here and check the backend again.</p>
+                            <button
+                              className="account-secondary-button"
+                              disabled={providerLoading}
+                              onClick={() => void loadProviderStatus()}
+                              type="button"
+                            >
+                              <RefreshCw className={providerLoading ? "spin" : ""} size={15} />
+                              {providerLoading ? "Checking…" : "Recheck connection"}
+                            </button>
+                          </div>
+                        </li>
+                      </ol>
+                      <p className="account-provider-command-note">
+                        These controls only copy text. OneTake never runs login commands in your browser.
+                      </p>
+                      {copyState?.status === "copied" ? (
+                        <p className="account-copy-status" role="status">
+                          {copyState.target === "tunnel" ? "Tunnel" : "Login"} command copied to the clipboard.
+                        </p>
+                      ) : copyState?.status === "error" ? (
+                        <p className="account-inline-error" role="alert">
+                          Copy was blocked by the browser. Select the command and copy it manually.
+                        </p>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </>
+              ) : null}
             </section>
           ) : null}
 

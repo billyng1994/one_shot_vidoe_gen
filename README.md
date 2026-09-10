@@ -32,7 +32,7 @@ cannot read the cookie; the CSRF token returned for an authenticated session is 
 memory. Project names and complete editor snapshots are saved on the backend and isolated
 by account.
 
-Everything durable lives under `BACKEND_DATA_DIR`:
+All durable OneTake application data lives under `BACKEND_DATA_DIR`:
 
 ```text
 backend/data/                         # default for a local backend
@@ -59,6 +59,9 @@ Deleting a project removes its project record, media, and job records.
 
 Back up the entire data directory as one unit and restrict it to the backend service account.
 It contains password hashes and active session hashes in addition to generated media.
+Docker keeps the Higgsfield OAuth files separately in the private
+`one-shot-video-studio_higgsfield-auth` named volume. Those provider credentials never pass
+through the API and are never sent to the browser.
 
 ## Local development
 
@@ -90,9 +93,10 @@ pnpm dev:backend
 pnpm dev:frontend
 ```
 
-### Higgsfield authentication
+### Higgsfield authentication for native development
 
-Install and authenticate the CLI on the backend host:
+When running the backend directly with `pnpm dev`, install and authenticate the CLI as the
+same operating-system user that runs the backend:
 
 ```bash
 brew install higgsfield-ai/tap/higgsfield
@@ -102,7 +106,8 @@ higgsfield auth token >/dev/null && echo "Higgsfield CLI is authenticated"
 
 Do not put OAuth access or refresh tokens in `.env.local`. The backend checks authentication
 before every generation. If an older npm-installed launcher reports `env: node: No such file
-or directory`, install the native Homebrew release or repair the launcher's Node path.
+or directory`, install the native Homebrew release or repair the launcher's Node path. Docker
+uses the separate container workflow below; it does not read the host user's CLI files.
 
 To exercise the complete API and disk-persistence path without spending credits, set:
 
@@ -156,12 +161,15 @@ every remote or production deployment:
    the `__Host-` cookie prefix.
 3. Expose the frontend only through that TLS endpoint; do not publish its HTTP port directly
    to the internet.
-4. Persist and back up `BACKEND_DATA_DIR` and protect the Higgsfield credentials mount.
+4. Persist and back up `BACKEND_DATA_DIR` and protect the Higgsfield authentication volume.
 
 Docker Compose builds separate frontend and backend images. The backend stays on the private
-Compose network, and the frontend HTTP port binds to `127.0.0.1` by default. A named volume
-keeps authentication data, project snapshots, jobs, images, videos, and final renders across
-container replacement.
+Compose network, and the frontend HTTP port binds to `127.0.0.1` by default. The
+`backend-data` volume keeps OneTake accounts, project snapshots, jobs, images, videos, and
+renders. The separately named `one-shot-video-studio_higgsfield-auth` volume is mounted at
+`/home/backend/.higgsfield` and keeps the backend CLI login across container replacement.
+There is no host-home bind mount, so running Compose as a different VM user cannot silently
+select the wrong credentials directory.
 
 Before starting, fill the blank `BACKEND_BOOTSTRAP_TOKEN` in `.env.local`. Docker Compose
 deliberately refuses to start without it:
@@ -176,15 +184,58 @@ loopback for the host reverse proxy and set `BACKEND_AUTH_COOKIE_SECURE=true`. I
 frontend-to-backend traffic can remain HTTP on the private Compose network; the browser-facing
 origin must be HTTPS.
 
-The host's `$HOME/.higgsfield` directory is mounted read/write into the backend container for
-CLI authentication, and `backend-data` is mounted at `/data`.
+### Connect Higgsfield in Docker
+
+Only an administrator can see provider diagnostics. In OneTake, open the account menu, choose
+the **Provider** tab, and follow its displayed SSH-tunnel and server-login commands. Run the
+server command on the Docker host—not in the browser. When OAuth succeeds, return to the
+Provider tab and choose **Recheck connection**. The tab requests only
+installed/authenticated status, CLI version, selected models, and setup commands. Access
+tokens, refresh tokens, and credential-file contents never reach the frontend.
+
+The [official Higgsfield CLI v1.1.24](https://github.com/higgsfield-ai/cli/tree/v1.1.24)
+`auth login` flow uses OAuth 2.0 PKCE and an HTTP loopback callback. It accepts `--port`,
+generates a `http://localhost:<port>/callback` redirect, and listens on `127.0.0.1` only. On a
+remote Linux VM, keep that callback private with an SSH tunnel. From a terminal on the computer
+where you will open the authorization page, connect with:
+
+```bash
+ssh -L 18765:127.0.0.1:18765 <vm-user>@<vm-host>
+```
+
+Keep that SSH session open. In its VM shell, change to the project directory and run the
+Provider-tab command:
+
+```bash
+docker run --rm -it --network host \
+  --mount source=one-shot-video-studio_higgsfield-auth,target=/home/backend/.higgsfield \
+  --entrypoint /usr/local/bin/higgsfield \
+  one-shot-video-backend:local auth login --port 18765
+```
+
+Open the authorization URL printed by the command in your local browser. Its localhost
+callback travels through SSH to the VM loopback interface and the one-off backend container.
+Do not open port 18765 in the VM firewall, cloud security group, reverse proxy, or Compose;
+the callback should remain loopback-only. `--network host` is intended for the Linux Docker
+Engine on the VM.
+
+The one-off container and the running backend share the same named volume. After login, this
+non-secret check should succeed, and **Recheck connection** should report ready without a
+backend restart:
+
+```bash
+docker compose --env-file .env.local exec backend \
+  /usr/local/bin/higgsfield auth token >/dev/null \
+  && echo "Backend Higgsfield authentication is valid"
+```
 
 ```bash
 docker compose down
 ```
 
-`docker compose down` keeps the data volume. Running it with `--volumes` intentionally and
-irreversibly removes accounts, project records, jobs, and generated media in that volume.
+`docker compose down` keeps both named volumes. Running it with `--volumes` intentionally and
+irreversibly removes accounts, project records, jobs, generated media, and the container's
+Higgsfield login. You must authenticate the provider again after deleting that auth volume.
 
 ## Accounts and user management
 
@@ -219,6 +270,7 @@ first obtain the CSRF token from `GET /api/auth/session` while retaining the ses
 | User | `DELETE /api/projects/{projectId}/media` | Remove one project's generated artifacts and jobs |
 | User | `GET /api/health` | Read CLI, model, and storage readiness |
 | User | `GET/HEAD /media/*` | Serve authorized stored files, including video ranges |
+| Admin | `GET /api/admin/provider` | Recheck sanitized backend CLI and provider readiness |
 | Admin | `GET/POST /api/admin/users` | List or create users |
 | Admin | `PATCH /api/admin/users/{userId}` | Update identity, role, password, or enabled status |
 | Admin | `POST /api/admin/users/{userId}/revoke-sessions` | Revoke a user's sessions |
