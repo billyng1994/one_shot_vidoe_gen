@@ -13,14 +13,11 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 
-import {
-  createStudioProject,
-  initializeProjectStorage,
-  readStudioProject,
-  saveProjectIndex,
-  saveStudioProject,
-  type StudioProject,
-} from "@/lib/studio-projects";
+import { AccountMenu } from "@/components/account-menu";
+import { useAuth } from "@/components/auth-provider";
+import { parseStudioProject, type StudioProject } from "@/lib/studio-projects";
+
+const MAX_PROJECTS = 50;
 
 function projectStage(project: StudioProject) {
   if (project.snapshot.video.url) return { step: 3, label: "Ready to compose" };
@@ -48,56 +45,71 @@ function updatedLabel(value: string) {
 
 export function ProjectDashboard() {
   const router = useRouter();
+  const { request } = useAuth();
   const [projects, setProjects] = useState<StudioProject[]>([]);
-  const [ready, setReady] = useState(false);
-  const [storageError, setStorageError] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [creating, setCreating] = useState(false);
+  const [error, setError] = useState("");
+  const [reloadVersion, setReloadVersion] = useState(0);
 
   useEffect(() => {
-    let loaded: StudioProject[] = [];
-    let unavailable = false;
-    try {
-      loaded = initializeProjectStorage(window.localStorage).projects;
-      unavailable = loaded.some(
-        (project) => !readStudioProject(window.localStorage, project.id),
-      );
-    } catch {
-      unavailable = true;
-    }
+    const controller = new AbortController();
+    let active = true;
 
-    loaded.sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt));
-    queueMicrotask(() => {
-      setProjects(loaded);
-      setStorageError(unavailable);
-      setReady(true);
-    });
-  }, []);
+    void request<{ projects: unknown[] }>("/api/projects", {
+      signal: controller.signal,
+    })
+      .then((response) => {
+        if (!Array.isArray(response.projects)) {
+          throw new Error("The server returned an invalid project list.");
+        }
+        const parsed = response.projects.map((project) => parseStudioProject(project));
+        if (parsed.some((project) => project === null)) {
+          throw new Error("The server returned an invalid project.");
+        }
+        const loaded = parsed as StudioProject[];
+        loaded.sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt));
+        if (!active) return;
+        setProjects(loaded);
+        setError("");
+        setLoading(false);
+      })
+      .catch((cause: unknown) => {
+        if (!active || (cause instanceof DOMException && cause.name === "AbortError")) return;
+        setError(cause instanceof Error ? cause.message : "Projects could not be loaded.");
+        setLoading(false);
+      });
 
-  const openProject = (projectId: string) => {
-    try {
-      saveProjectIndex(window.localStorage, projects, projectId);
-    } catch {
-      // Navigation still works for this browser session.
-    }
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, [reloadVersion, request]);
+
+  const retry = () => {
+    setError("");
+    setLoading(true);
+    setReloadVersion((version) => version + 1);
   };
 
-  const createProject = () => {
-    if (storageError || projects.length >= 50) return;
-    const project = createStudioProject("Untitled project");
-    const nextProjects = [project, ...projects];
-    let saved = false;
+  const createProject = async () => {
+    if (creating || loading || projects.length >= MAX_PROJECTS) return;
+    setCreating(true);
+    setError("");
     try {
-      saved = saveStudioProject(window.localStorage, project);
-      if (saved) saveProjectIndex(window.localStorage, nextProjects, project.id);
-    } catch {
-      saved = false;
+      const response = await request<unknown>("/api/projects", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: "Untitled project" }),
+      });
+      const project = parseStudioProject(response);
+      if (!project) throw new Error("The server returned an invalid project.");
+      setProjects((current) => [project, ...current]);
+      router.push(`/projects/${project.id}`);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "The project could not be created.");
+      setCreating(false);
     }
-    if (!saved) {
-      setStorageError(true);
-      window.alert("A new project could not be saved. Check this browser's storage settings.");
-      return;
-    }
-    setProjects(nextProjects);
-    router.push(`/projects/${project.id}`);
   };
 
   return (
@@ -107,9 +119,12 @@ export function ProjectDashboard() {
           <span className="brand-mark"><Film size={19} /></span>
           <span>OneTake</span>
         </Link>
-        <span className="local-workspace-pill">
-          <FolderOpen size={14} /> Media stored on backend
-        </span>
+        <div className="dashboard-header-actions">
+          <span className="local-workspace-pill">
+            <FolderOpen size={14} /> Projects and media stored on backend
+          </span>
+          <AccountMenu />
+        </div>
       </header>
 
       <section className="dashboard-content">
@@ -123,26 +138,38 @@ export function ProjectDashboard() {
           </div>
           <button
             className="new-project-button"
-            disabled={storageError || projects.length >= 50}
+            disabled={creating || loading || projects.length >= MAX_PROJECTS}
             onClick={createProject}
             type="button"
           >
-            <Plus size={18} /> New project
+            {creating ? <Clock3 className="spin" size={18} /> : <Plus size={18} />}
+            {creating ? "Creating…" : "New project"}
           </button>
         </div>
 
-        {storageError ? (
+        {error ? (
           <div className="dashboard-storage-error" role="alert">
-            <strong>Browser storage is unavailable.</strong>
-            <span>Allow local storage for this site to create and reopen projects.</span>
+            <strong>Projects are unavailable.</strong>
+            <span>{error}</span>
+            <button onClick={retry} type="button">Retry</button>
           </div>
         ) : null}
 
-        {!ready ? (
+        {loading ? (
           <div className="project-grid" aria-busy="true" aria-label="Loading projects">
             {[0, 1, 2].map((item) => (
               <div className="project-card project-card-skeleton" key={item} />
             ))}
+          </div>
+        ) : projects.length === 0 ? (
+          <div className="project-grid" aria-label="Projects">
+            <section className="project-card">
+              <div className="project-card-body">
+                <span className="dashboard-eyebrow">EMPTY LIBRARY</span>
+                <h2>No projects yet</h2>
+                <p>Create a project to generate your first frame and video.</p>
+              </div>
+            </section>
           </div>
         ) : (
           <div className="project-grid" aria-label="Projects">
@@ -158,7 +185,6 @@ export function ProjectDashboard() {
                   className="project-card"
                   href={`/projects/${project.id}`}
                   key={project.id}
-                  onClick={() => openProject(project.id)}
                   prefetch={false}
                 >
                   <div className="project-thumbnail">

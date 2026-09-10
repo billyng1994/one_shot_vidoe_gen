@@ -11,6 +11,13 @@ services:
       BACKEND_PORT: 4000
       BACKEND_DATA_DIR: /data
       BACKEND_CORS_ORIGIN: "${BACKEND_CORS_ORIGIN:-}"
+      BACKEND_BOOTSTRAP_TOKEN: "${BACKEND_BOOTSTRAP_TOKEN:?Set BACKEND_BOOTSTRAP_TOKEN to at least 32 random characters}"
+      # This Compose stack serves local HTTP. Set true only when users reach the
+      # frontend through a trusted HTTPS reverse proxy.
+      BACKEND_AUTH_COOKIE_SECURE: "${BACKEND_AUTH_COOKIE_SECURE:-false}"
+      BACKEND_AUTH_SESSION_TTL_MS: "${BACKEND_AUTH_SESSION_TTL_MS:-604800000}"
+      BACKEND_LOGIN_ATTEMPT_LIMIT: "${BACKEND_LOGIN_ATTEMPT_LIMIT:-5}"
+      BACKEND_LOGIN_WINDOW_MS: "${BACKEND_LOGIN_WINDOW_MS:-900000}"
       BACKEND_MAX_CLI_CONCURRENCY: "${BACKEND_MAX_CLI_CONCURRENCY:-2}"
       BACKEND_MAX_RENDER_CONCURRENCY: "${BACKEND_MAX_RENDER_CONCURRENCY:-1}"
       BACKEND_MAX_IMAGE_BYTES: "${BACKEND_MAX_IMAGE_BYTES:-31457280}"
@@ -51,7 +58,9 @@ services:
       backend:
         condition: service_healthy
     ports:
-      - "80:3000"
+      # Safe local default: the HTTP listener is not reachable from other hosts.
+      # Keep this loopback-bound behind a host TLS reverse proxy in production.
+      - "${STUDIO_BIND_ADDRESS:-127.0.0.1}:${STUDIO_HTTP_PORT:-80}:3000"
     cap_drop:
       - ALL
     security_opt:

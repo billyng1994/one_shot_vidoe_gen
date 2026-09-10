@@ -32,11 +32,14 @@ import {
   type CSSProperties,
   type KeyboardEvent,
   type PointerEvent,
+  useCallback,
   useEffect,
   useRef,
   useState,
 } from "react";
 
+import { AccountMenu } from "@/components/account-menu";
+import { useAuth } from "@/components/auth-provider";
 import {
   BRAND_LOGO_RECT,
   DEFAULT_TITLE,
@@ -53,17 +56,7 @@ import {
   type PersistedAsset,
   type StudioSnapshot,
 } from "@/lib/studio-state";
-import {
-  createStudioProject,
-  initializeProjectStorage,
-  readStudioProject,
-  removeStudioProject,
-  renameStudioProject,
-  saveProjectIndex,
-  saveStudioProject,
-  type StudioProject,
-  updateProjectSnapshot,
-} from "@/lib/studio-projects";
+import { parseStudioProject, type StudioProject } from "@/lib/studio-projects";
 
 type Step = 1 | 2 | 3;
 type JobPhase = "idle" | "submitting" | GenerationStatus | "error";
@@ -80,18 +73,7 @@ const MOTION_IDEAS = [
   "Slow cinematic dolly-in; preserve faces, clothing, and composition",
 ];
 
-async function jsonRequest<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, init);
-  const body = (await response.json().catch(() => null)) as
-    | (T & { error?: string })
-    | null;
-
-  if (!response.ok) {
-    throw new Error(body?.error ?? `Request failed with status ${response.status}.`);
-  }
-  if (!body) throw new Error("The server returned an empty response.");
-  return body;
-}
+type ApiRequest = <T>(url: string, init?: RequestInit) => Promise<T>;
 
 function sleep(milliseconds: number, signal?: AbortSignal) {
   return new Promise<void>((resolve, reject) => {
@@ -111,6 +93,7 @@ function sleep(milliseconds: number, signal?: AbortSignal) {
 async function pollGeneration(
   initial: GenerationRequest,
   onStatus: (status: GenerationStatus) => void,
+  request: ApiRequest,
   signal?: AbortSignal,
 ) {
   let result = initial;
@@ -130,7 +113,7 @@ async function pollGeneration(
       );
     }
     await sleep(delay, signal);
-    result = await jsonRequest<GenerationRequest>(
+    result = await request<GenerationRequest>(
       `/api/generations/${encodeURIComponent(result.request_id)}`,
       { cache: "no-store", signal },
     );
@@ -331,6 +314,7 @@ function EmptyArtwork({ kind }: { kind: "image" | "video" }) {
 
 export function Studio({ initialProjectId }: { initialProjectId: string }) {
   const router = useRouter();
+  const { request } = useAuth();
   const [step, setStep] = useState<Step>(1);
   const [health, setHealth] = useState<BackendHealth | null>(null);
   const [imagePrompt, setImagePrompt] = useState("");
@@ -354,8 +338,21 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
   const [activeProjectId, setActiveProjectId] = useState("");
   const [hydratedProjectId, setHydratedProjectId] = useState("");
   const [projectMissing, setProjectMissing] = useState(false);
+  const [projectLoadError, setProjectLoadError] = useState("");
+  const [projectActionBusy, setProjectActionBusy] = useState(false);
+  const [saveStatus, setSaveStatus] = useState<"idle" | "dirty" | "saving" | "saved" | "error">("idle");
   const projectsRef = useRef<StudioProject[]>([]);
   const activeProjectIdRef = useRef("");
+  const lastSavedSnapshotRef = useRef("");
+  const saveRevisionRef = useRef(0);
+  const saveTimerRef = useRef<number | undefined>(undefined);
+  const pendingSaveRef = useRef<{
+    projectId: string;
+    revision: number;
+    serialized: string;
+    snapshot: StudioSnapshot;
+  } | null>(null);
+  const saveInFlightRef = useRef<Promise<void> | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const dragRef = useRef<{
@@ -368,49 +365,107 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
     height: number;
   } | null>(null);
 
+  const runQueuedSave = useCallback(async () => {
+    if (saveTimerRef.current !== undefined) {
+      window.clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = undefined;
+    }
+    if (saveInFlightRef.current) return saveInFlightRef.current;
+
+    const operation = (async () => {
+      while (pendingSaveRef.current) {
+        const pending = pendingSaveRef.current;
+        pendingSaveRef.current = null;
+        setSaveStatus("saving");
+        try {
+          const updated = await request<StudioProject>(
+            `/api/projects/${encodeURIComponent(pending.projectId)}`,
+            {
+              method: "PATCH",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ snapshot: pending.snapshot }),
+            },
+          );
+          lastSavedSnapshotRef.current = pending.serialized;
+          projectsRef.current = projectsRef.current.map((project) =>
+            project.id === pending.projectId
+              ? { ...project, name: updated.name, updatedAt: updated.updatedAt }
+              : project,
+          );
+        } catch (error) {
+          if (!pendingSaveRef.current) pendingSaveRef.current = pending;
+          setSaveStatus("error");
+          throw error;
+        }
+      }
+      setSaveStatus("saved");
+    })();
+
+    saveInFlightRef.current = operation;
+    try {
+      await operation;
+    } finally {
+      if (saveInFlightRef.current === operation) saveInFlightRef.current = null;
+    }
+  }, [request]);
+
   useEffect(() => {
-    jsonRequest<BackendHealth>("/api/health", { cache: "no-store" })
+    request<BackendHealth>("/api/health", { cache: "no-store" })
       .then(setHealth)
       .catch(() => setHealth(null));
-  }, []);
+  }, [request]);
 
   useEffect(() => {
-    let collection;
-    try {
-      collection = initializeProjectStorage(window.localStorage);
-    } catch {
-      const project = createStudioProject("Untitled project");
-      collection = { projects: [project], activeProjectId: project.id };
-    }
-
-    projectsRef.current = collection.projects;
-    const requestedProject = collection.projects.find(
-      (project) => project.id === initialProjectId,
-    );
-    if (!requestedProject) {
-      activeProjectIdRef.current = "";
-      queueMicrotask(() => {
-        setProjects(collection.projects);
-        setActiveProjectId("");
-        setHydratedProjectId("");
-        setProjectMissing(true);
-      });
-      return;
-    }
-
-    const requestedProjectId = requestedProject.id;
-    activeProjectIdRef.current = requestedProjectId;
-    try {
-      saveProjectIndex(window.localStorage, collection.projects, requestedProjectId);
-    } catch {
-      // The requested project still opens for this browser session.
-    }
+    const controller = new AbortController();
+    let active = true;
+    activeProjectIdRef.current = "";
     queueMicrotask(() => {
-      setProjects(collection.projects);
+      if (!active) return;
+      setActiveProjectId("");
+      setHydratedProjectId("");
       setProjectMissing(false);
-      setActiveProjectId(requestedProjectId);
+      setProjectLoadError("");
     });
-  }, [initialProjectId]);
+
+    const loadProject = async () => {
+      try {
+        if (pendingSaveRef.current || saveInFlightRef.current) await runQueuedSave();
+        const response = await request<{ projects: unknown[] }>("/api/projects", {
+          cache: "no-store",
+          signal: controller.signal,
+        });
+        if (!Array.isArray(response.projects)) {
+          throw new Error("The server returned an invalid project list.");
+        }
+        const parsed = response.projects.map((project) => parseStudioProject(project));
+        if (parsed.some((project) => project === null)) {
+          throw new Error("The server returned an invalid project.");
+        }
+        if (!active) return;
+        const loadedProjects = parsed as StudioProject[];
+        projectsRef.current = loadedProjects;
+        setProjects(loadedProjects);
+        const requestedProject = loadedProjects.find(({ id }) => id === initialProjectId);
+        if (!requestedProject) {
+          setProjectMissing(true);
+          return;
+        }
+        activeProjectIdRef.current = requestedProject.id;
+        setActiveProjectId(requestedProject.id);
+      } catch (error) {
+        if (!active || controller.signal.aborted) return;
+        setProjectLoadError(
+          error instanceof Error ? error.message : "The project library could not be loaded.",
+        );
+      }
+    };
+    void loadProject();
+
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, [initialProjectId, request, runQueuedSave]);
 
   useEffect(() => {
     if (!activeProjectId) return;
@@ -418,22 +473,19 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
     const controller = new AbortController();
     let active = true;
     const workspaceId = activeProjectId;
-    let project: StudioProject | null = null;
-    try {
-      project = readStudioProject(window.localStorage, workspaceId);
-    } catch {
-      // Fall back to the in-memory copy when browser storage is unavailable.
-    }
-    project ??= projectsRef.current.find((candidate) => candidate.id === workspaceId) ?? null;
+    const project = projectsRef.current.find((candidate) => candidate.id === workspaceId) ?? null;
     if (!project) return;
     const snapshot = project.snapshot;
+    lastSavedSnapshotRef.current = JSON.stringify(snapshot);
+    pendingSaveRef.current = null;
+    setSaveStatus("idle");
 
     const restoreAsset = async (kind: "image" | "video", asset: PersistedAsset) => {
       if (!asset.requestId || asset.requestId.startsWith("demo-")) return;
       const setJob = kind === "image" ? setImageJob : setVideoJob;
 
       try {
-        const current = await jsonRequest<GenerationRequest>(
+        const current = await request<GenerationRequest>(
           `/api/generations/${encodeURIComponent(asset.requestId)}`,
           { cache: "no-store", signal: controller.signal },
         );
@@ -444,6 +496,7 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
           (phase) => {
             if (active && activeProjectIdRef.current === workspaceId) setJob({ phase });
           },
+          request,
           controller.signal,
         );
         if (!active || activeProjectIdRef.current !== workspaceId) return;
@@ -518,7 +571,7 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
       active = false;
       controller.abort();
     };
-  }, [activeProjectId]);
+  }, [activeProjectId, request]);
 
   useEffect(() => {
     if (!activeProjectId || hydratedProjectId !== activeProjectId) return;
@@ -536,20 +589,20 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
       title,
       musicVolume,
     };
-    const currentProject = projectsRef.current.find(
-      (project) => project.id === activeProjectId,
-    );
-    if (!currentProject) return;
-
-    const updatedProject = updateProjectSnapshot(currentProject, snapshot);
+    const serialized = JSON.stringify(snapshot);
+    if (serialized === lastSavedSnapshotRef.current) return;
+    const revision = saveRevisionRef.current + 1;
+    saveRevisionRef.current = revision;
+    pendingSaveRef.current = { projectId: activeProjectId, revision, serialized, snapshot };
     projectsRef.current = projectsRef.current.map((project) =>
-      project.id === activeProjectId ? updatedProject : project,
+      project.id === activeProjectId ? { ...project, snapshot } : project,
     );
-    try {
-      saveStudioProject(window.localStorage, updatedProject);
-    } catch {
-      // The in-memory workspace remains usable when browser storage is unavailable.
-    }
+    if (saveTimerRef.current !== undefined) window.clearTimeout(saveTimerRef.current);
+    setSaveStatus("dirty");
+    saveTimerRef.current = window.setTimeout(() => {
+      saveTimerRef.current = undefined;
+      void runQueuedSave().catch(() => undefined);
+    }, 650);
   }, [
     activeProjectId,
     cameraFixed,
@@ -565,7 +618,17 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
     title,
     videoRequestId,
     videoUrl,
+    runQueuedSave,
   ]);
+
+  useEffect(() => {
+    const warnBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (!pendingSaveRef.current && !saveInFlightRef.current) return;
+      event.preventDefault();
+    };
+    window.addEventListener("beforeunload", warnBeforeUnload);
+    return () => window.removeEventListener("beforeunload", warnBeforeUnload);
+  }, []);
 
   useEffect(() => {
     window.scrollTo({ top: 0, left: 0, behavior: "auto" });
@@ -595,157 +658,150 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
     musicVolume,
   });
 
-  const persistActiveProject = () => {
+  const persistActiveProject = async () => {
     if (!activeProjectId || hydratedProjectId !== activeProjectId) return;
     const currentProject = projectsRef.current.find(
       (project) => project.id === activeProjectId,
     );
     if (!currentProject) return;
 
-    const updatedProject = updateProjectSnapshot(
-      currentProject,
-      snapshotCurrentWorkspace(),
-    );
-    projectsRef.current = projectsRef.current.map((project) =>
-      project.id === activeProjectId ? updatedProject : project,
-    );
-    try {
-      saveStudioProject(window.localStorage, updatedProject);
-    } catch {
-      // The project remains available for this browser session.
+    const snapshot = snapshotCurrentWorkspace();
+    const serialized = JSON.stringify(snapshot);
+    if (serialized !== lastSavedSnapshotRef.current) {
+      const revision = saveRevisionRef.current + 1;
+      saveRevisionRef.current = revision;
+      pendingSaveRef.current = {
+        projectId: activeProjectId,
+        revision,
+        serialized,
+        snapshot,
+      };
+      projectsRef.current = projectsRef.current.map((project) =>
+        project.id === activeProjectId ? { ...project, snapshot } : project,
+      );
     }
+    await runQueuedSave();
   };
 
-  const selectProject = (projectId: string) => {
+  const selectProject = async (projectId: string) => {
     if (
       projectId === activeProjectId ||
+      projectActionBusy ||
       !projectsRef.current.some((project) => project.id === projectId)
     ) return;
 
-    persistActiveProject();
-    activeProjectIdRef.current = projectId;
-    setHydratedProjectId("");
-    setActiveProjectId(projectId);
-    router.push(`/projects/${projectId}`, { scroll: false });
+    setProjectActionBusy(true);
     try {
-      saveProjectIndex(window.localStorage, projectsRef.current, projectId);
-    } catch {
-      // The selection still works for this browser session.
+      await persistActiveProject();
+      activeProjectIdRef.current = projectId;
+      setHydratedProjectId("");
+      setActiveProjectId(projectId);
+      router.push(`/projects/${projectId}`, { scroll: false });
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : "The project could not be saved.");
+    } finally {
+      setProjectActionBusy(false);
     }
   };
 
-  const createProject = () => {
-    if (projectsRef.current.length >= 50) {
-      window.alert("This browser already has the maximum of 50 projects.");
+  const createProject = async () => {
+    if (projectActionBusy || projectsRef.current.length >= 50) {
+      if (projectsRef.current.length >= 50) {
+        window.alert("This account already has the maximum of 50 projects.");
+      }
       return;
     }
-    persistActiveProject();
-    const project = createStudioProject(`Project ${projectsRef.current.length + 1}`);
-    const nextProjects = [...projectsRef.current, project];
-    let saved = false;
+    setProjectActionBusy(true);
     try {
-      saved = saveStudioProject(window.localStorage, project);
-      if (saved) saveProjectIndex(window.localStorage, nextProjects, project.id);
-    } catch {
-      saved = false;
+      await persistActiveProject();
+      const project = await request<StudioProject>("/api/projects", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: `Project ${projectsRef.current.length + 1}` }),
+      });
+      const nextProjects = [...projectsRef.current, project];
+      projectsRef.current = nextProjects;
+      activeProjectIdRef.current = project.id;
+      setProjects(nextProjects);
+      setHydratedProjectId("");
+      setActiveProjectId(project.id);
+      router.push(`/projects/${project.id}`, { scroll: false });
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : "A new project could not be created.");
+    } finally {
+      setProjectActionBusy(false);
     }
-    if (!saved) {
-      window.alert("A new project could not be saved. Check this browser's storage settings.");
-      return;
-    }
-
-    projectsRef.current = nextProjects;
-    activeProjectIdRef.current = project.id;
-    setProjects(nextProjects);
-    setHydratedProjectId("");
-    setActiveProjectId(project.id);
-    router.push(`/projects/${project.id}`, { scroll: false });
   };
 
-  const renameActiveProject = () => {
+  const renameActiveProject = async () => {
     const project = projectsRef.current.find(({ id }) => id === activeProjectId);
-    if (!project) return;
+    if (!project || projectActionBusy) return;
     const name = window.prompt("Project name", project.name);
     if (name === null || !name.trim()) return;
 
-    persistActiveProject();
-    const updatedProject = renameStudioProject(
-      projectsRef.current.find(({ id }) => id === activeProjectId) ?? project,
-      name,
-    );
-    const nextProjects = projectsRef.current.map((candidate) =>
-      candidate.id === activeProjectId ? updatedProject : candidate,
-    );
-    let saved = false;
+    setProjectActionBusy(true);
     try {
-      saved = saveStudioProject(window.localStorage, updatedProject);
-      if (saved) saveProjectIndex(window.localStorage, nextProjects, activeProjectId);
-    } catch {
-      saved = false;
+      await persistActiveProject();
+      const updatedProject = await request<StudioProject>(
+        `/api/projects/${encodeURIComponent(activeProjectId)}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name }),
+        },
+      );
+      const nextProjects = projectsRef.current.map((candidate) =>
+        candidate.id === activeProjectId ? updatedProject : candidate,
+      );
+      projectsRef.current = nextProjects;
+      lastSavedSnapshotRef.current = JSON.stringify(updatedProject.snapshot);
+      setProjects(nextProjects);
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : "This project could not be renamed.");
+    } finally {
+      setProjectActionBusy(false);
     }
-    if (!saved) {
-      window.alert("This project could not be renamed because browser storage is unavailable.");
-      return;
-    }
-    projectsRef.current = nextProjects;
-    setProjects(nextProjects);
   };
 
-  const deleteActiveProject = () => {
+  const deleteActiveProject = async () => {
     const project = projectsRef.current.find(({ id }) => id === activeProjectId);
-    if (!project) return;
-    if (!window.confirm(`Delete “${project.name}”? This cannot be undone.`)) return;
-
-    let nextProjects = projectsRef.current.filter(({ id }) => id !== project.id);
-    let replacement: StudioProject | null = null;
-    if (nextProjects.length === 0) {
-      replacement = createStudioProject("Untitled project");
-      let replacementSaved = false;
-      try {
-        replacementSaved = saveStudioProject(window.localStorage, replacement);
-      } catch {
-        replacementSaved = false;
-      }
-      if (!replacementSaved) {
-        window.alert("A replacement project could not be saved, so this project was not deleted.");
-        return;
-      }
-      nextProjects = [replacement];
-    }
-
-    let removed = false;
-    try {
-      removed = removeStudioProject(window.localStorage, project.id);
-    } catch {
-      removed = false;
-    }
-    if (!removed) {
-      if (replacement) {
-        try {
-          removeStudioProject(window.localStorage, replacement.id);
-        } catch {
-          // A harmless orphan record may remain and will be recovered on the next load.
-        }
-      }
-      window.alert("This project could not be deleted because browser storage is unavailable.");
+    if (!project || projectActionBusy) return;
+    if (!window.confirm(`Delete “${project.name}” and all of its generated media? This cannot be undone.`)) {
       return;
     }
 
-    const nextActiveProjectId = nextProjects[0].id;
-    projectsRef.current = nextProjects;
-    activeProjectIdRef.current = nextActiveProjectId;
-    try {
-      saveProjectIndex(window.localStorage, nextProjects, nextActiveProjectId);
-    } catch {
-      // The remaining projects stay available for this browser session.
+    setProjectActionBusy(true);
+    if (saveTimerRef.current !== undefined) {
+      window.clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = undefined;
     }
-    setProjects(nextProjects);
-    setHydratedProjectId("");
-    setActiveProjectId(nextActiveProjectId);
-    router.replace(`/projects/${nextActiveProjectId}`, { scroll: false });
-    void fetch(`/api/projects/${encodeURIComponent(project.id)}/media`, {
-      method: "DELETE",
-    });
+    pendingSaveRef.current = null;
+    try {
+      await saveInFlightRef.current?.catch(() => undefined);
+      pendingSaveRef.current = null;
+      await request<{ deleted: boolean }>(
+        `/api/projects/${encodeURIComponent(project.id)}`,
+        { method: "DELETE" },
+      );
+      const nextProjects = projectsRef.current.filter(({ id }) => id !== project.id);
+      projectsRef.current = nextProjects;
+      setProjects(nextProjects);
+      setHydratedProjectId("");
+      if (nextProjects.length === 0) {
+        activeProjectIdRef.current = "";
+        setActiveProjectId("");
+        router.replace("/");
+        return;
+      }
+      const nextProjectId = nextProjects[0].id;
+      activeProjectIdRef.current = nextProjectId;
+      setActiveProjectId(nextProjectId);
+      router.replace(`/projects/${nextProjectId}`, { scroll: false });
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : "This project could not be deleted.");
+    } finally {
+      setProjectActionBusy(false);
+    }
   };
 
   const generateImage = async () => {
@@ -761,14 +817,18 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
     setVideoJob({ phase: "idle" });
     setImageJob({ phase: "submitting" });
     try {
-      const initial = await jsonRequest<GenerationRequest>("/api/generations/image", {
+      const initial = await request<GenerationRequest>("/api/generations/image", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ projectId: activeProjectId, prompt: imagePrompt }),
       });
       setImageRequestId(initial.request_id);
       setImageJob({ phase: initial.status });
-      const result = await pollGeneration(initial, (phase) => setImageJob({ phase }));
+      const result = await pollGeneration(
+        initial,
+        (phase) => setImageJob({ phase }),
+        request,
+      );
       const url = result.images?.[0]?.url;
       if (!url) throw new Error("Higgsfield completed without returning an image URL.");
       setImageUrl(url);
@@ -793,7 +853,7 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
     setVideoRequestId("");
     setVideoJob({ phase: "submitting" });
     try {
-      const initial = await jsonRequest<GenerationRequest>("/api/generations/video", {
+      const initial = await request<GenerationRequest>("/api/generations/video", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -807,7 +867,11 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
       });
       setVideoRequestId(initial.request_id);
       setVideoJob({ phase: initial.status });
-      const result = await pollGeneration(initial, (phase) => setVideoJob({ phase }));
+      const result = await pollGeneration(
+        initial,
+        (phase) => setVideoJob({ phase }),
+        request,
+      );
       const url = result.video?.url;
       if (!url) throw new Error("Higgsfield completed without returning a video URL.");
       setVideoUrl(url);
@@ -924,13 +988,10 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
       form.append("musicVolume", String(musicVolume));
       if (music) form.append("music", music, music.name);
 
-      const response = await fetch("/api/render", { method: "POST", body: form });
-      if (!response.ok) {
-        const body = (await response.json().catch(() => null)) as { error?: string } | null;
-        throw new Error(body?.error ?? "The final MP4 could not be rendered.");
-      }
-
-      const result = (await response.json()) as RenderResponse;
+      const result = await request<RenderResponse>("/api/render", {
+        method: "POST",
+        body: form,
+      });
       if (!result.url || !result.filename) {
         throw new Error("The backend did not return a saved render.");
       }
@@ -954,6 +1015,7 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
     imageBusy ||
     videoBusy ||
     renderBusy ||
+    projectActionBusy ||
     !activeProjectId ||
     hydratedProjectId !== activeProjectId;
 
@@ -962,11 +1024,24 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
       <main className="missing-project">
         <span className="brand-mark"><Film size={19} /></span>
         <span className="dashboard-eyebrow">PROJECT NOT FOUND</span>
-        <h1 className="sr-only">This workspace is not saved in this browser.</h1>
-        <p>It may have been deleted, or the link may belong to another device.</p>
+        <h1 className="sr-only">This project is unavailable.</h1>
+        <p>It may have been deleted, or it may belong to another account.</p>
         <Link className="primary-button" href="/">
           <ArrowLeft size={17} /> Back to projects
         </Link>
+      </main>
+    );
+  }
+
+  if (projectLoadError) {
+    return (
+      <main className="missing-project">
+        <span className="brand-mark"><Film size={19} /></span>
+        <span className="dashboard-eyebrow">PROJECT UNAVAILABLE</span>
+        <p>{projectLoadError}</p>
+        <button className="primary-button" onClick={() => window.location.reload()} type="button">
+          Try again
+        </button>
       </main>
     );
   }
@@ -996,22 +1071,40 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
           videoReady={Boolean(videoUrl)}
           onStep={setStep}
         />
-        <div
-          className={`api-status ${
-            health?.configured || health?.mockMode ? "is-connected" : ""
-          }`}
-          title="Higgsfield CLI connection"
-        >
-          <span className="status-light" />
-          {health?.mockMode
-            ? "Demo API"
-            : health?.configured
-              ? "Higgsfield CLI ready"
-              : health && !health.storage.writable
-                ? "Storage unavailable"
-              : health
-                ? "CLI login needed"
-                : "Checking CLI"}
+        <div className="header-end">
+          <button
+            className={`save-status save-status-${saveStatus}`}
+            disabled={saveStatus !== "error"}
+            onClick={() => { void runQueuedSave().catch(() => undefined); }}
+            title={saveStatus === "error" ? "Retry saving this project" : "Project save status"}
+            type="button"
+          >
+            {saveStatus === "dirty" || saveStatus === "saving"
+              ? "Saving…"
+              : saveStatus === "error"
+                ? "Save failed · Retry"
+                : saveStatus === "saved"
+                  ? "Saved"
+                  : ""}
+          </button>
+          <div
+            className={`api-status ${
+              health?.configured || health?.mockMode ? "is-connected" : ""
+            }`}
+            title="Higgsfield CLI connection"
+          >
+            <span className="status-light" />
+            {health?.mockMode
+              ? "Demo API"
+              : health?.configured
+                ? "Higgsfield CLI ready"
+                : health && !health.storage.writable
+                  ? "Storage unavailable"
+                : health
+                  ? "CLI login needed"
+                  : "Checking CLI"}
+          </div>
+          <AccountMenu />
         </div>
       </header>
 

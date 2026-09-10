@@ -1,7 +1,5 @@
 import { clampNumber, DEFAULT_TITLE, type TitlePlacement } from "./composition";
 
-export const STUDIO_STORAGE_KEY = "onetake:studio:v1";
-
 export type PersistedAsset = {
   requestId: string;
   url: string;

@@ -55,7 +55,7 @@ export function createMediaHandler(storage: MediaStorage) {
 
       response.set({
         "Accept-Ranges": "bytes",
-        "Cache-Control": "public, max-age=31536000, immutable",
+        "Cache-Control": "private, max-age=31536000, immutable",
         "Content-Type": contentTypeForFilename(file.parsed.filename),
         "X-Content-Type-Options": "nosniff",
       });
