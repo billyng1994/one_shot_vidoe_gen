@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   findRecentHiggsfieldImage,
+  getHiggsfieldGeneration,
   HiggsfieldError,
   submitHiggsfieldImage,
   submitHiggsfieldVideo,
@@ -29,6 +30,98 @@ afterEach(() => {
 });
 
 describe("backend Higgsfield CLI adapter", () => {
+  it.each(["waiting", "script", "visuals", "flow", "vision", "dna"])(
+    "keeps the Higgsfield %s phase in progress",
+    async (status) => {
+      const runner = vi
+        .fn<CliRunner>()
+        .mockImplementationOnce(() => result({ help: true }))
+        .mockImplementationOnce(() => result({ help: true }))
+        .mockImplementationOnce(() => result({ authenticated: true }))
+        .mockImplementationOnce(() => result({ id: VIDEO_JOB_ID, status }));
+
+      await expect(
+        getHiggsfieldGeneration(`cli-video-${VIDEO_JOB_ID}`, { runner }),
+      ).resolves.toEqual({
+        status: "in_progress",
+        request_id: `cli-video-${VIDEO_JOB_ID}`,
+      });
+    },
+  );
+
+  it("maps Higgsfield's IP-detection terminal state to a safety rejection", async () => {
+    const runner = vi
+      .fn<CliRunner>()
+      .mockImplementationOnce(() => result({ help: true }))
+      .mockImplementationOnce(() => result({ help: true }))
+      .mockImplementationOnce(() => result({ authenticated: true }))
+      .mockImplementationOnce(() => result({ id: VIDEO_JOB_ID, status: "ip_detected" }));
+
+    await expect(
+      getHiggsfieldGeneration(`cli-video-${VIDEO_JOB_ID}`, { runner }),
+    ).resolves.toEqual({
+      status: "nsfw",
+      request_id: `cli-video-${VIDEO_JOB_ID}`,
+    });
+  });
+
+  it("keeps an unknown provider phase nonterminal until Higgsfield reports an outcome", async () => {
+    const runner = vi
+      .fn<CliRunner>()
+      .mockImplementationOnce(() => result({ help: true }))
+      .mockImplementationOnce(() => result({ help: true }))
+      .mockImplementationOnce(() => result({ authenticated: true }))
+      .mockImplementationOnce(() => result({ id: VIDEO_JOB_ID, status: "future_pipeline_phase" }));
+
+    await expect(
+      getHiggsfieldGeneration(`cli-video-${VIDEO_JOB_ID}`, { runner }),
+    ).resolves.toEqual({
+      status: "in_progress",
+      request_id: `cli-video-${VIDEO_JOB_ID}`,
+    });
+  });
+
+  it("keeps an explicit provider error terminal when its status is unknown", async () => {
+    const runner = vi
+      .fn<CliRunner>()
+      .mockImplementationOnce(() => result({ help: true }))
+      .mockImplementationOnce(() => result({ help: true }))
+      .mockImplementationOnce(() => result({ authenticated: true }))
+      .mockImplementationOnce(() => result({
+        error: "Provider rejected the request.",
+        id: VIDEO_JOB_ID,
+        status: "future_terminal_phase",
+      }));
+
+    await expect(
+      getHiggsfieldGeneration(`cli-video-${VIDEO_JOB_ID}`, { runner }),
+    ).resolves.toEqual({
+      error: "Provider rejected the request.",
+      status: "failed",
+      request_id: `cli-video-${VIDEO_JOB_ID}`,
+    });
+  });
+
+  it("does not treat an informational provider message as a failure", async () => {
+    const runner = vi
+      .fn<CliRunner>()
+      .mockImplementationOnce(() => result({ help: true }))
+      .mockImplementationOnce(() => result({ help: true }))
+      .mockImplementationOnce(() => result({ authenticated: true }))
+      .mockImplementationOnce(() => result({
+        id: VIDEO_JOB_ID,
+        message: "Preparing the next pipeline stage.",
+        status: "future_pipeline_phase",
+      }));
+
+    await expect(
+      getHiggsfieldGeneration(`cli-video-${VIDEO_JOB_ID}`, { runner }),
+    ).resolves.toEqual({
+      status: "in_progress",
+      request_id: `cli-video-${VIDEO_JOB_ID}`,
+    });
+  });
+
   it("authenticates and checks the model schema before passing a prompt as one argv", async () => {
     const runner = vi
       .fn<CliRunner>()

@@ -94,6 +94,10 @@ function cleanInternalError(error: unknown) {
   return message.replace(/\s+/g, " ").trim().slice(0, 400);
 }
 
+function isLegacyStatusFailure(job: GenerationJob) {
+  return job.status === "failed" && job.error === undefined && job.output === undefined;
+}
+
 export class GenerationService {
   private readonly cli: Semaphore;
   private readonly workers = new Map<string, Promise<void>>();
@@ -291,16 +295,27 @@ export class GenerationService {
   async get(requestId: string) {
     parseBackendRequestId(requestId);
     const job = await this.jobs.read(requestId);
-    if (!TERMINAL_STATUSES.has(job.status) && !this.deletingProjects.has(job.projectId)) {
-      this.enqueue(job.requestId);
+    const recheckLegacyFailure = !this.options.mockMode && isLegacyStatusFailure(job);
+    if (
+      (!TERMINAL_STATUSES.has(job.status) || recheckLegacyFailure) &&
+      !this.deletingProjects.has(job.projectId)
+    ) {
+      this.enqueue(job.requestId, recheckLegacyFailure);
     }
-    return publicGeneration(job);
+    return publicGeneration(
+      recheckLegacyFailure && this.workers.has(job.requestId)
+        ? { ...job, status: "in_progress" }
+        : job,
+    );
   }
 
   async resumePendingJobs() {
     const jobs = await this.jobs.list();
     for (const job of jobs) {
-      if (!TERMINAL_STATUSES.has(job.status)) this.enqueue(job.requestId);
+      const recheckLegacyFailure = !this.options.mockMode && isLegacyStatusFailure(job);
+      if (!TERMINAL_STATUSES.has(job.status) || recheckLegacyFailure) {
+        this.enqueue(job.requestId, recheckLegacyFailure);
+      }
     }
   }
 
@@ -331,11 +346,11 @@ export class GenerationService {
     }
   }
 
-  private enqueue(requestId: string) {
+  private enqueue(requestId: string, recheckLegacyFailure = false) {
     if (this.workers.has(requestId)) return;
     const controller = new AbortController();
     this.workerControllers.set(requestId, controller);
-    const worker = this.runWorker(requestId, controller.signal)
+    const worker = this.runWorker(requestId, controller.signal, recheckLegacyFailure)
       .catch((error) => {
         this.logger.error(`Generation worker ${requestId} stopped: ${cleanInternalError(error)}`);
       })
@@ -348,7 +363,11 @@ export class GenerationService {
     this.workers.set(requestId, worker);
   }
 
-  private async runWorker(requestId: string, signal: AbortSignal) {
+  private async runWorker(
+    requestId: string,
+    signal: AbortSignal,
+    recheckLegacyFailure = false,
+  ) {
     const deadline = Date.now() + this.options.pollWindowMs;
     let delay = 0;
 
@@ -362,7 +381,10 @@ export class GenerationService {
         if (error instanceof BackendError && error.status === 404) return;
         throw error;
       }
-      if (TERMINAL_STATUSES.has(job.status)) return;
+      if (
+        TERMINAL_STATUSES.has(job.status) &&
+        !(recheckLegacyFailure && isLegacyStatusFailure(job))
+      ) return;
 
       try {
         const refreshed = await this.refresh(job, signal);
@@ -413,10 +435,15 @@ export class GenerationService {
     }
 
     if (providerResult.status !== "completed") {
+      const error = providerResult.error ?? (
+        providerResult.status === "failed"
+          ? "Higgsfield reported that this generation failed."
+          : undefined
+      );
       return this.jobs.update(job.requestId, (current) => ({
         ...current,
         status: providerResult.status,
-        ...(providerResult.error ? { error: providerResult.error } : {}),
+        ...(error ? { error } : {}),
         lastPollError: undefined,
         updatedAt: new Date().toISOString(),
       }));

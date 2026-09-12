@@ -26,6 +26,129 @@ async function waitForCompleted(service: GenerationService, requestId: string) {
 }
 
 describe("generation service", () => {
+  it("rechecks a persisted failed job with no provider error on startup", async () => {
+    const dataDirectory = await mkdtemp(join(tmpdir(), "backend-generation-test-"));
+    temporaryDirectories.push(dataDirectory);
+    const jobs = new JobStore(dataDirectory);
+    const media = new MediaStorage(
+      dataDirectory,
+      assetsDirectory,
+      { image: 5 * 1024 * 1024, video: 5 * 1024 * 1024 },
+    );
+    const requestId = "gen-video-22222222-2222-4222-8222-222222222222";
+    const providerRequestId = "cli-video-33333333-3333-4333-8333-333333333333";
+    const now = new Date().toISOString();
+    await jobs.create({
+      version: 1,
+      requestId,
+      providerRequestId,
+      projectId: PROJECT_ID,
+      kind: "video",
+      prompt: "A persisted motion prompt",
+      status: "failed",
+      createdAt: now,
+      updatedAt: now,
+    });
+    const getGeneration = vi
+      .fn<ProviderAdapter["getGeneration"]>()
+      .mockResolvedValueOnce({ status: "in_progress", request_id: providerRequestId })
+      .mockResolvedValueOnce({ status: "canceled", request_id: providerRequestId });
+    const submitImage = vi.fn<ProviderAdapter["submitImage"]>();
+    const submitVideo = vi.fn<ProviderAdapter["submitVideo"]>();
+    const provider: ProviderAdapter = {
+      findRecentImage: async () => undefined,
+      findRecentVideo: async () => undefined,
+      getGeneration,
+      health: async () => ({ installed: true, authenticated: true, version: "test" }),
+      imageModel: () => "gpt_image_2",
+      submitImage,
+      submitVideo,
+      videoModel: () => "seedance_2_0",
+    };
+    const service = new GenerationService(
+      jobs,
+      media,
+      {
+        cliConcurrency: 1,
+        mockMode: false,
+        pollInitialDelayMs: 1,
+        pollMaxDelayMs: 2,
+        pollWindowMs: 1_000,
+      },
+      provider,
+    );
+
+    await service.initialize();
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if ((await jobs.read(requestId)).status === "canceled") break;
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 5));
+    }
+
+    expect(getGeneration).toHaveBeenCalledTimes(2);
+    expect(getGeneration).toHaveBeenCalledWith(providerRequestId, expect.any(AbortSignal));
+    expect(submitImage).not.toHaveBeenCalled();
+    expect(submitVideo).not.toHaveBeenCalled();
+    expect((await jobs.read(requestId)).status).toBe("canceled");
+  });
+
+  it("does not recheck a persisted failed job that has a provider error", async () => {
+    const dataDirectory = await mkdtemp(join(tmpdir(), "backend-generation-test-"));
+    temporaryDirectories.push(dataDirectory);
+    const jobs = new JobStore(dataDirectory);
+    const media = new MediaStorage(
+      dataDirectory,
+      assetsDirectory,
+      { image: 5 * 1024 * 1024, video: 5 * 1024 * 1024 },
+    );
+    const requestId = "gen-video-55555555-5555-4555-8555-555555555555";
+    const providerRequestId = "cli-video-66666666-6666-4666-8666-666666666666";
+    const now = new Date().toISOString();
+    await jobs.create({
+      version: 1,
+      requestId,
+      providerRequestId,
+      projectId: PROJECT_ID,
+      kind: "video",
+      prompt: "A provider-rejected motion prompt",
+      status: "failed",
+      error: "The provider rejected this generation.",
+      createdAt: now,
+      updatedAt: now,
+    });
+    const getGeneration = vi.fn<ProviderAdapter["getGeneration"]>();
+    const provider: ProviderAdapter = {
+      findRecentImage: async () => undefined,
+      findRecentVideo: async () => undefined,
+      getGeneration,
+      health: async () => ({ installed: true, authenticated: true, version: "test" }),
+      imageModel: () => "gpt_image_2",
+      submitImage: vi.fn<ProviderAdapter["submitImage"]>(),
+      submitVideo: vi.fn<ProviderAdapter["submitVideo"]>(),
+      videoModel: () => "seedance_2_0",
+    };
+    const service = new GenerationService(
+      jobs,
+      media,
+      {
+        cliConcurrency: 1,
+        mockMode: false,
+        pollInitialDelayMs: 1,
+        pollMaxDelayMs: 2,
+        pollWindowMs: 1_000,
+      },
+      provider,
+    );
+
+    await service.initialize();
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+
+    expect(getGeneration).not.toHaveBeenCalled();
+    await expect(service.get(requestId)).resolves.toMatchObject({
+      status: "failed",
+      error: "The provider rejected this generation.",
+    });
+  });
+
   it("copies mock image and video into durable project storage", async () => {
     const dataDirectory = await mkdtemp(join(tmpdir(), "backend-generation-test-"));
     temporaryDirectories.push(dataDirectory);

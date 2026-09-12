@@ -480,7 +480,11 @@ async function recoverRecentJob(
       const createdAt =
         typeof job.created_at === "string" ? Date.parse(job.created_at) : Number.NaN;
       const resultUrl = extractResultUrl(job);
-      const status = normalizeStatus(job.status ?? job.state, Boolean(resultUrl));
+      const status = normalizeStatus(
+        job.status ?? job.state,
+        Boolean(resultUrl),
+        Boolean(stringValue(job.error)),
+      );
       return (
         matchesModel(job, input.model) &&
         params?.prompt === input.prompt &&
@@ -588,18 +592,35 @@ function extractResultUrl(job: CliJob) {
   }
 }
 
-function normalizeStatus(value: unknown, hasResult: boolean): GenerationStatus {
-  if (typeof value !== "string") return hasResult ? "completed" : "queued";
+function normalizeStatus(value: unknown, hasResult: boolean, hasError = false): GenerationStatus {
+  if (typeof value !== "string") {
+    return hasResult ? "completed" : hasError ? "failed" : "queued";
+  }
 
   const status = value.toLowerCase().replaceAll("-", "_").replaceAll(" ", "_");
   if (["created", "pending", "submitted", "queued"].includes(status)) return "queued";
-  if (["running", "processing", "in_progress"].includes(status)) return "in_progress";
+  if (
+    [
+      "running",
+      "processing",
+      "in_progress",
+      "waiting",
+      "script",
+      "visuals",
+      "flow",
+      "vision",
+      "dna",
+    ].includes(status)
+  ) {
+    return "in_progress";
+  }
   if (["complete", "completed", "done", "success", "succeeded"].includes(status)) {
     return "completed";
   }
-  if (["nsfw", "moderated", "safety_rejected"].includes(status)) return "nsfw";
+  if (["nsfw", "moderated", "safety_rejected", "ip_detected"].includes(status)) return "nsfw";
   if (["cancelled", "canceled"].includes(status)) return "canceled";
-  return "failed";
+  if (["failed", "failure", "error"].includes(status)) return "failed";
+  return hasResult ? "completed" : hasError ? "failed" : "in_progress";
 }
 
 function publicRequestId(kind: GenerationKind, jobId: string) {
@@ -622,8 +643,15 @@ export function parsePublicRequestId(requestId: string) {
 function normalizeJob(job: CliJob, kind: GenerationKind, knownJobId?: string) {
   const jobId = knownJobId ?? extractJobId(job);
   const resultUrl = extractResultUrl(job);
-  const status = normalizeStatus(job.status ?? job.state, Boolean(resultUrl));
-  const error = stringValue(job.error, job.message);
+  const explicitError = stringValue(job.error);
+  const status = normalizeStatus(
+    job.status ?? job.state,
+    Boolean(resultUrl),
+    Boolean(explicitError),
+  );
+  const error = explicitError ?? (
+    status === "failed" || status === "canceled" ? stringValue(job.message) : undefined
+  );
   const normalized: GenerationRequest = {
     status,
     request_id: publicRequestId(kind, jobId),
