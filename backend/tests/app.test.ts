@@ -162,12 +162,13 @@ describe("Express backend API", () => {
       models: { image: "GPT Image 2", video: "Seedance 2.0" },
       connection: {
         kind: "ssh-loopback",
-        callbackPort: 18_765,
-        tunnelCommand: "ssh -L 18765:127.0.0.1:18765 <vm-user>@<vm-host>",
+        callbackPort: 8_765,
+        tunnelCommand:
+          "ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -L 8765:127.0.0.1:8765 <vm-user>@<vm-host>",
         command:
-          "docker run --rm -it --network host --mount source=one-shot-video-studio_higgsfield-auth,target=/home/backend/.higgsfield --entrypoint /usr/local/bin/higgsfield one-shot-video-backend:local auth login --port 18765",
+          "docker run --rm -it --network host --mount source=one-shot-video-studio_higgsfield-auth,target=/home/backend/.higgsfield --entrypoint /usr/local/bin/higgsfield one-shot-video-backend:local auth login --port 8765",
         description:
-          "Open the SSH tunnel from your computer, then run the server command and complete login in your local browser.",
+          "Open one SSH tunnel without sudo and leave it running, then run the server command and complete login in your local browser. If SSH reports Address already in use, resume or stop the existing tunnel instead of starting another.",
       },
     });
     expect(providerStatus.headers["cache-control"]).toBe("private, no-store");

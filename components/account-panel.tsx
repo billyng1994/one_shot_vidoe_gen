@@ -929,8 +929,10 @@ export function AccountPanel({ open, onClose }: AccountPanelProps) {
 
                   {showProviderGuide ? (
                     <div
+                      aria-label="Higgsfield CLI connection instructions"
                       className="account-provider-command"
                       ref={providerGuideRef}
+                      role="region"
                       tabIndex={-1}
                     >
                       <div className="account-section-heading">
@@ -943,8 +945,11 @@ export function AccountPanel({ open, onClose }: AccountPanelProps) {
                           <div>
                             <h4>Open the SSH tunnel locally</h4>
                             <p>
-                              Run this on your computer and keep the SSH session open. It forwards
-                              the CLI callback on port {providerStatus.connection.callbackPort}.
+                              Run this on your computer without <code>sudo</code>, in a dedicated
+                              terminal. Replace <code>{"<vm-user>"}</code> and <code>{"<vm-host>"}</code>,
+                              then enter your SSH password. A blank terminal means the tunnel is
+                              running. Keep it in the foreground: <kbd>Ctrl</kbd>+<kbd>Z</kbd> suspends
+                              SSH but leaves port {providerStatus.connection.callbackPort} reserved.
                             </p>
                             <div className="account-command-box">
                               <code>{providerStatus.connection.tunnelCommand}</code>
@@ -965,6 +970,13 @@ export function AccountPanel({ open, onClose }: AccountPanelProps) {
                                   : "Copy tunnel"}
                               </button>
                             </div>
+                            <p>
+                              If SSH reports <code>Address already in use</code>, do not start a
+                              second tunnel. In the original terminal, run <code>jobs</code> and
+                              resume the suspended tunnel with <code>fg %1</code> (replace 1 with
+                              its job number), then leave it running. To restart it, bring it to
+                              the foreground, press <kbd>Ctrl</kbd>+<kbd>C</kbd>, and rerun the command.
+                            </p>
                           </div>
                         </li>
                         <li>
@@ -972,8 +984,10 @@ export function AccountPanel({ open, onClose }: AccountPanelProps) {
                           <div>
                             <h4>Run the login command on the server</h4>
                             <p>
-                              Run this in that SSH session. If Higgsfield prints an authorization
-                              URL, copy it into your local browser to finish signing in.
+                              Open a second terminal, SSH to the VM normally, and run this there.
+                              Add <code>sudo</code> only before <code>docker</code> if Docker reports
+                              a socket permission error. Open the fresh authorization URL in your
+                              local browser and keep the tunnel open until the CLI reports success.
                             </p>
                             <div className="account-command-box">
                               <code>{providerStatus.connection.command}</code>
@@ -1014,7 +1028,8 @@ export function AccountPanel({ open, onClose }: AccountPanelProps) {
                         </li>
                       </ol>
                       <p className="account-provider-command-note">
-                        These controls only copy text. OneTake never runs login commands in your browser.
+                        These controls only copy text. OneTake never runs login commands in your browser,
+                        and the callback port does not need to be opened in Azure or Caddy.
                       </p>
                       {copyState?.status === "copied" ? (
                         <p className="account-copy-status" role="status">

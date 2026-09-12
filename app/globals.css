@@ -3081,7 +3081,7 @@ input[type="range"] {
   overflow-x: auto;
   padding: 13px 14px;
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-  font-size: 10px;
+  font-size: 0.75rem;
   line-height: 1.55;
   white-space: nowrap;
   user-select: all;
@@ -3152,13 +3152,13 @@ input[type="range"] {
 
 .account-provider-steps h4 {
   margin: 3px 0 0;
-  font-size: 11px;
+  font-size: 0.8125rem;
 }
 
 .account-provider-steps p {
   margin: 5px 0 11px;
   color: var(--muted);
-  font-size: 9px;
+  font-size: 0.75rem;
   line-height: 1.55;
 }
 
@@ -3168,7 +3168,7 @@ input[type="range"] {
   color: #6d675f;
   border-radius: 9px;
   background: #f2f0eb;
-  font-size: 9px;
+  font-size: 0.75rem;
   line-height: 1.5;
 }
 

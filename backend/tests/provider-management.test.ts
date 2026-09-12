@@ -8,6 +8,15 @@ import {
 } from "../src/provider-management.js";
 
 describe("provider management service", () => {
+  it("uses a registered Higgsfield callback port for the SSH login guide", () => {
+    expect(HIGGSFIELD_CALLBACK_PORT).toBe(8_765);
+    expect(HIGGSFIELD_TUNNEL_COMMAND).toBe(
+      "ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -L 8765:127.0.0.1:8765 <vm-user>@<vm-host>",
+    );
+    expect(HIGGSFIELD_LOGIN_COMMAND).toContain("auth login --port 8765");
+    expect(HIGGSFIELD_LOGIN_COMMAND).not.toContain("18765");
+  });
+
   it("reruns health and returns only explicitly safe provider fields", async () => {
     const secret = "provider-access-token-must-not-leak";
     const health = vi.fn(async () => ({
@@ -43,7 +52,7 @@ describe("provider management service", () => {
         tunnelCommand: HIGGSFIELD_TUNNEL_COMMAND,
         command: HIGGSFIELD_LOGIN_COMMAND,
         description:
-          "Open the SSH tunnel from your computer, then run the server command and complete login in your local browser.",
+          "Open one SSH tunnel without sudo and leave it running, then run the server command and complete login in your local browser. If SSH reports Address already in use, resume or stop the existing tunnel instead of starting another.",
       },
     });
     expect(second).toEqual(first);

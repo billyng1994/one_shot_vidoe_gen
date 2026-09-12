@@ -1,10 +1,10 @@
 import type { GenerationService } from "./generation-service.js";
 
 export const HIGGSFIELD_LOGIN_COMMAND =
-  "docker run --rm -it --network host --mount source=one-shot-video-studio_higgsfield-auth,target=/home/backend/.higgsfield --entrypoint /usr/local/bin/higgsfield one-shot-video-backend:local auth login --port 18765";
-export const HIGGSFIELD_CALLBACK_PORT = 18_765;
+  "docker run --rm -it --network host --mount source=one-shot-video-studio_higgsfield-auth,target=/home/backend/.higgsfield --entrypoint /usr/local/bin/higgsfield one-shot-video-backend:local auth login --port 8765";
+export const HIGGSFIELD_CALLBACK_PORT = 8_765;
 export const HIGGSFIELD_TUNNEL_COMMAND =
-  "ssh -L 18765:127.0.0.1:18765 <vm-user>@<vm-host>";
+  "ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -L 8765:127.0.0.1:8765 <vm-user>@<vm-host>";
 
 type ProviderHealthSource = Pick<GenerationService, "health">;
 
@@ -70,7 +70,7 @@ export class ProviderManagementService {
         tunnelCommand: HIGGSFIELD_TUNNEL_COMMAND,
         command: HIGGSFIELD_LOGIN_COMMAND,
         description:
-          "Open the SSH tunnel from your computer, then run the server command and complete login in your local browser.",
+          "Open one SSH tunnel without sudo and leave it running, then run the server command and complete login in your local browser. If SSH reports Address already in use, resume or stop the existing tunnel instead of starting another.",
       },
     };
   }

@@ -197,25 +197,37 @@ The [official Higgsfield CLI v1.1.24](https://github.com/higgsfield-ai/cli/tree/
 `auth login` flow uses OAuth 2.0 PKCE and an HTTP loopback callback. It accepts `--port`,
 generates a `http://localhost:<port>/callback` redirect, and listens on `127.0.0.1` only. On a
 remote Linux VM, keep that callback private with an SSH tunnel. From a terminal on the computer
-where you will open the authorization page, connect with:
+where you will open the authorization page, connect without `sudo` and use the CLI's registered
+default callback port:
 
 ```bash
-ssh -L 18765:127.0.0.1:18765 <vm-user>@<vm-host>
+ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
+  -L 8765:127.0.0.1:8765 <vm-user>@<vm-host>
 ```
 
-Keep that SSH session open. In its VM shell, change to the project directory and run the
-Provider-tab command:
+After SSH accepts your password, a blank terminal is expected: the tunnel is running. Keep that
+terminal open; do not press `Ctrl+Z`, which suspends SSH while leaving port 8765 reserved. Open a
+second terminal, SSH to the VM normally, change to the project directory, and run the Provider-tab
+command:
 
 ```bash
 docker run --rm -it --network host \
   --mount source=one-shot-video-studio_higgsfield-auth,target=/home/backend/.higgsfield \
   --entrypoint /usr/local/bin/higgsfield \
-  one-shot-video-backend:local auth login --port 18765
+  one-shot-video-backend:local auth login --port 8765
 ```
+
+If Docker reports permission denied for its socket, rerun only the Docker command with `sudo`.
+Do not use `sudo` for the local SSH command.
+
+If SSH reports `Address already in use`, do not create another tunnel. In the terminal where the
+previous tunnel was started, run `jobs`, then `fg %1` (replace `1` with the displayed job number)
+to resume it and leave it open. Alternatively, bring it to the foreground and press `Ctrl+C` to
+stop it before retrying.
 
 Open the authorization URL printed by the command in your local browser. Its localhost
 callback travels through SSH to the VM loopback interface and the one-off backend container.
-Do not open port 18765 in the VM firewall, cloud security group, reverse proxy, or Compose;
+Do not open port 8765 in the VM firewall, cloud security group, reverse proxy, or Compose;
 the callback should remain loopback-only. `--network host` is intended for the Linux Docker
 Engine on the VM.
 
