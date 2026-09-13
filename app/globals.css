@@ -915,8 +915,10 @@ textarea:focus {
 }
 
 .secondary-button {
+  color: var(--ink);
   border: 1px solid #d9d5ce;
   background: #fff;
+  text-decoration: none;
 }
 
 .secondary-button:hover {

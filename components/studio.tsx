@@ -64,6 +64,7 @@ import type {
   OverlayUploadResponse,
   RenderResponse,
 } from "@/lib/api-types";
+import { mediaDownloadFilename } from "@/lib/media-download";
 import {
   type PersistedAsset,
   type StudioSnapshot,
@@ -1386,9 +1387,18 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
                   {imageUrl ? "Generate another" : "Generate first frame"}
                 </button>
                 {imageUrl ? (
-                  <button className="secondary-button" onClick={() => setStep(2)} type="button">
-                    Use this image <ArrowRight size={17} />
-                  </button>
+                  <>
+                    <a
+                      className="secondary-button"
+                      download={mediaDownloadFilename("image", imageUrl)}
+                      href={imageUrl}
+                    >
+                      <Download aria-hidden="true" size={17} /> Download image
+                    </a>
+                    <button className="secondary-button" onClick={() => setStep(2)} type="button">
+                      Use this image <ArrowRight size={17} />
+                    </button>
+                  </>
                 ) : null}
               </div>
 
@@ -1538,9 +1548,18 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
                   {videoUrl ? "Generate another" : "Generate video"}
                 </button>
                 {videoUrl ? (
-                  <button className="secondary-button" onClick={() => setStep(3)} type="button">
-                    Open composer <ArrowRight size={17} />
-                  </button>
+                  <>
+                    <a
+                      className="secondary-button"
+                      download={mediaDownloadFilename("video", videoUrl)}
+                      href={videoUrl}
+                    >
+                      <Download aria-hidden="true" size={17} /> Download unedited video
+                    </a>
+                    <button className="secondary-button" onClick={() => setStep(3)} type="button">
+                      Open composer <ArrowRight size={17} />
+                    </button>
+                  </>
                 ) : null}
               </div>
             </aside>
