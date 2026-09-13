@@ -18,10 +18,8 @@ import {
   Pencil,
   Play,
   Plus,
-  RotateCcw,
   Sparkles,
   Trash2,
-  Type,
   Upload,
   Volume2,
   X,
@@ -29,7 +27,6 @@ import {
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
-  type CSSProperties,
   type KeyboardEvent,
   type PointerEvent,
   useCallback,
@@ -40,16 +37,31 @@ import {
 
 import { AccountMenu } from "@/components/account-menu";
 import { useAuth } from "@/components/auth-provider";
+import { CompositionEditor } from "@/components/composition-editor";
 import {
-  BRAND_LOGO_RECT,
+  createDefaultLayers,
+  createDefaultLogoLayer,
+  createTextLayer,
+  clampNumber,
   DEFAULT_TITLE,
+  FONT_FAMILIES,
+  imageLayerHeight,
+  MAX_IMAGE_ASPECT_RATIO,
+  MAX_COMPOSITION_LAYERS,
+  maximumImageLayerWidth,
+  MIN_IMAGE_ASPECT_RATIO,
+  MIN_IMAGE_LAYER_WIDTH,
   OUTPUT_SIZE,
-  type TitlePlacement,
+  positionLayer,
+  wrappedTextLines,
+  type CompositionLayer,
+  type ImageLayer,
 } from "@/lib/composition";
 import type {
   BackendHealth,
   GenerationRequest,
   GenerationStatus,
+  OverlayUploadResponse,
   RenderResponse,
 } from "@/lib/api-types";
 import {
@@ -328,7 +340,9 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
   const [cameraFixed, setCameraFixed] = useState(false);
   const [imageJob, setImageJob] = useState<JobState>({ phase: "idle" });
   const [videoJob, setVideoJob] = useState<JobState>({ phase: "idle" });
-  const [title, setTitle] = useState<TitlePlacement>(DEFAULT_TITLE);
+  const [layers, setLayers] = useState<CompositionLayer[]>(createDefaultLayers);
+  const [selectedLayerId, setSelectedLayerId] = useState("text-1");
+  const [assetUploadBusy, setAssetUploadBusy] = useState(false);
   const [music, setMusic] = useState<File | null>(null);
   const [musicUrl, setMusicUrl] = useState("");
   const [musicVolume, setMusicVolume] = useState(0.24);
@@ -343,6 +357,8 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
   const [saveStatus, setSaveStatus] = useState<"idle" | "dirty" | "saving" | "saved" | "error">("idle");
   const projectsRef = useRef<StudioProject[]>([]);
   const activeProjectIdRef = useRef("");
+  const requestedProjectIdRef = useRef(initialProjectId);
+  const uploadRevisionRef = useRef(0);
   const lastSavedSnapshotRef = useRef("");
   const saveRevisionRef = useRef(0);
   const saveTimerRef = useRef<number | undefined>(undefined);
@@ -356,6 +372,7 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const dragRef = useRef<{
+    layerId: string;
     pointerId: number;
     startClientX: number;
     startClientY: number;
@@ -418,6 +435,8 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
   useEffect(() => {
     const controller = new AbortController();
     let active = true;
+    requestedProjectIdRef.current = initialProjectId;
+    uploadRevisionRef.current += 1;
     activeProjectIdRef.current = "";
     queueMicrotask(() => {
       if (!active) return;
@@ -539,7 +558,13 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
       setDuration(snapshot.duration);
       setResolution(snapshot.resolution);
       setCameraFixed(snapshot.cameraFixed);
-      setTitle(snapshot.title);
+      setLayers(snapshot.layers);
+      setSelectedLayerId(
+        snapshot.layers.findLast((layer) => layer.type === "text")?.id
+          ?? snapshot.layers.at(-1)?.id
+          ?? "",
+      );
+      setAssetUploadBusy(false);
       setMusicVolume(snapshot.musicVolume);
       setMusic(null);
       setMusicUrl("");
@@ -577,7 +602,7 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
     if (!activeProjectId || hydratedProjectId !== activeProjectId) return;
 
     const snapshot: StudioSnapshot = {
-      version: 1,
+      version: 2,
       step,
       imagePrompt,
       motionPrompt,
@@ -586,7 +611,7 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
       duration,
       resolution,
       cameraFixed,
-      title,
+      layers,
       musicVolume,
     };
     const serialized = JSON.stringify(snapshot);
@@ -615,7 +640,7 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
     musicVolume,
     resolution,
     step,
-    title,
+    layers,
     videoRequestId,
     videoUrl,
     runQueuedSave,
@@ -645,7 +670,7 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
   }, [musicUrl, musicVolume]);
 
   const snapshotCurrentWorkspace = (): StudioSnapshot => ({
-    version: 1,
+    version: 2,
     step,
     imagePrompt,
     motionPrompt,
@@ -654,7 +679,7 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
     duration,
     resolution,
     cameraFixed,
-    title,
+    layers,
     musicVolume,
   });
 
@@ -894,7 +919,8 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
     setVideoRequestId("");
     setImageJob({ phase: "completed" });
     setVideoJob({ phase: "completed" });
-    setTitle({ ...DEFAULT_TITLE, text: "Make one idea\nfeel alive" });
+    setLayers(createDefaultLayers({ ...DEFAULT_TITLE, text: "Make one idea\nfeel alive" }));
+    setSelectedLayerId("text-1");
     setStep(3);
   };
 
@@ -929,35 +955,212 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
     if (Math.abs(audio.currentTime - target) > 0.45) audio.currentTime = target;
   };
 
-  const startTitleDrag = (event: PointerEvent<HTMLDivElement>) => {
+  const normalizeEditableLayer = (layer: CompositionLayer): CompositionLayer => {
+    if (layer.type === "text") {
+      const width = clampNumber(layer.width, 0.12, 0.96);
+      return positionLayer(
+        {
+          ...layer,
+          width,
+          fontSize: clampNumber(layer.fontSize, 18, 180),
+          strokeWidth: clampNumber(layer.strokeWidth, 0, 20),
+        },
+        layer.x,
+        layer.y,
+      );
+    }
+    const maximumWidth = maximumImageLayerWidth(layer);
+    return positionLayer(
+      { ...layer, width: clampNumber(layer.width, MIN_IMAGE_LAYER_WIDTH, maximumWidth) },
+      layer.x,
+      layer.y,
+    );
+  };
+
+  const updateLayer = (nextLayer: CompositionLayer) => {
+    setLayers((current) => current.map((layer) =>
+      layer.id === nextLayer.id ? normalizeEditableLayer(nextLayer) : layer,
+    ));
+  };
+
+  const addTextLayer = () => {
+    if (layers.length >= MAX_COMPOSITION_LAYERS) return;
+    const textCount = layers.filter((layer) => layer.type === "text").length + 1;
+    const offset = Math.min(0.18, textCount * 0.025);
+    const layer = positionLayer(
+      { ...createTextLayer(`text-${crypto.randomUUID()}`, textCount), x: 0.08 + offset, y: 0.2 + offset },
+      0.08 + offset,
+      0.2 + offset,
+    );
+    setLayers((current) => [...current, layer]);
+    setSelectedLayerId(layer.id);
+  };
+
+  const uploadCompositionImage = async (file: File, projectId: string) => {
+    const form = new FormData();
+    form.append("image", file, file.name);
+    const uploaded = await request<OverlayUploadResponse>(
+      `/api/projects/${encodeURIComponent(projectId)}/assets`,
+      { method: "POST", body: form },
+    );
+    if (
+      !uploaded.url ||
+      !Number.isFinite(uploaded.width) ||
+      uploaded.width <= 0 ||
+      !Number.isFinite(uploaded.height) ||
+      uploaded.height <= 0
+    ) {
+      throw new Error("The backend returned an invalid uploaded image.");
+    }
+    return uploaded;
+  };
+
+  const addImageLayer = async (file: File) => {
+    if (layers.length >= MAX_COMPOSITION_LAYERS || assetUploadBusy) return;
+    const workspaceId = activeProjectIdRef.current;
+    if (!workspaceId || requestedProjectIdRef.current !== workspaceId) {
+      throw new Error("Open a project before uploading an image.");
+    }
+    const uploadRevision = uploadRevisionRef.current + 1;
+    uploadRevisionRef.current = uploadRevision;
+    setAssetUploadBusy(true);
+    try {
+      const uploaded = await uploadCompositionImage(file, workspaceId);
+      if (
+        uploadRevisionRef.current !== uploadRevision ||
+        activeProjectIdRef.current !== workspaceId ||
+        requestedProjectIdRef.current !== workspaceId
+      ) return;
+      const aspectRatio = clampNumber(
+        uploaded.width / uploaded.height,
+        MIN_IMAGE_ASPECT_RATIO,
+        MAX_IMAGE_ASPECT_RATIO,
+      );
+      const maximumWidth = maximumImageLayerWidth({ aspectRatio, mask: "none" });
+      const width = Math.min(maximumWidth, Math.min(0.32, Math.max(0.1, aspectRatio * 0.25)));
+      const baseName = file.name.replace(/\.[^.]+$/, "").trim().slice(0, 40) || "Image";
+      const layer = positionLayer<ImageLayer>({
+        id: `image-${crypto.randomUUID()}`,
+        type: "image",
+        role: "overlay",
+        name: baseName,
+        src: uploaded.url,
+        x: 0.5 - width / 2,
+        y: 0.34,
+        width,
+        aspectRatio,
+        mask: "none",
+      }, 0.5 - width / 2, 0.34);
+      setLayers((current) => [...current, layer]);
+      setSelectedLayerId(layer.id);
+    } finally {
+      if (uploadRevisionRef.current === uploadRevision) setAssetUploadBusy(false);
+    }
+  };
+
+  const replaceLogo = async (file: File) => {
+    if (assetUploadBusy) return;
+    const workspaceId = activeProjectIdRef.current;
+    if (!workspaceId || requestedProjectIdRef.current !== workspaceId) {
+      throw new Error("Open a project before uploading an image.");
+    }
+    const uploadRevision = uploadRevisionRef.current + 1;
+    uploadRevisionRef.current = uploadRevision;
+    setAssetUploadBusy(true);
+    try {
+      const uploaded = await uploadCompositionImage(file, workspaceId);
+      if (
+        uploadRevisionRef.current !== uploadRevision ||
+        activeProjectIdRef.current !== workspaceId ||
+        requestedProjectIdRef.current !== workspaceId
+      ) return;
+      const aspectRatio = clampNumber(
+        uploaded.width / uploaded.height,
+        MIN_IMAGE_ASPECT_RATIO,
+        MAX_IMAGE_ASPECT_RATIO,
+      );
+      const maximumWidth = maximumImageLayerWidth({ aspectRatio, mask: "none" });
+      const width = Math.min(maximumWidth, clampNumber(aspectRatio * 0.09, 0.08, 0.36));
+      const logo = positionLayer<ImageLayer>({
+        ...createDefaultLogoLayer(),
+        src: uploaded.url,
+        width,
+        aspectRatio,
+      }, 0.5 - width / 2, 0.02);
+      setLayers((current) => {
+        const index = current.findIndex(
+          (layer) => layer.type === "image" && layer.role === "logo",
+        );
+        if (index < 0) return [logo, ...current];
+        return current.map((layer, layerIndex) => layerIndex === index ? logo : layer);
+      });
+      setSelectedLayerId(logo.id);
+    } finally {
+      if (uploadRevisionRef.current === uploadRevision) setAssetUploadBusy(false);
+    }
+  };
+
+  const restoreDefaultLogo = () => {
+    const logo = createDefaultLogoLayer();
+    setLayers((current) => current.map((layer) =>
+      layer.type === "image" && layer.role === "logo" ? logo : layer,
+    ));
+    setSelectedLayerId(logo.id);
+  };
+
+  const deleteLayer = (layerId: string) => {
+    const layer = layers.find((candidate) => candidate.id === layerId);
+    if (!layer || (layer.type === "image" && layer.role === "logo")) return;
+    const next = layers.filter((candidate) => candidate.id !== layerId);
+    setLayers(next);
+    setSelectedLayerId(next.at(-1)?.id ?? "");
+  };
+
+  const startLayerDrag = (layer: CompositionLayer, event: PointerEvent<HTMLDivElement>) => {
+    if (
+      renderJob.phase === "in_progress" ||
+      assetUploadBusy ||
+      projectActionBusy ||
+      !activeProjectId ||
+      hydratedProjectId !== activeProjectId
+    ) return;
     const canvas = event.currentTarget.parentElement;
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
     dragRef.current = {
+      layerId: layer.id,
       pointerId: event.pointerId,
       startClientX: event.clientX,
       startClientY: event.clientY,
-      startX: title.x,
-      startY: title.y,
+      startX: layer.x,
+      startY: layer.y,
       width: rect.width,
       height: rect.height,
     };
+    setSelectedLayerId(layer.id);
+    event.currentTarget.focus();
     event.currentTarget.setPointerCapture(event.pointerId);
+    event.preventDefault();
   };
 
-  const moveTitle = (event: PointerEvent<HTMLDivElement>) => {
+  const moveLayerOnCanvas = (event: PointerEvent<HTMLDivElement>) => {
     const drag = dragRef.current;
     if (!drag || drag.pointerId !== event.pointerId) return;
     const nextX = drag.startX + (event.clientX - drag.startClientX) / drag.width;
     const nextY = drag.startY + (event.clientY - drag.startClientY) / drag.height;
-    setTitle((current) => ({
-      ...current,
-      x: Math.min(0.82, Math.max(0.02, nextX)),
-      y: Math.min(0.84, Math.max(0.13, nextY)),
-    }));
+    setLayers((current) => current.map((layer) =>
+      layer.id === drag.layerId ? positionLayer(layer, nextX, nextY) : layer,
+    ));
   };
 
-  const nudgeTitle = (event: KeyboardEvent<HTMLDivElement>) => {
+  const nudgeLayer = (layerId: string, event: KeyboardEvent<HTMLDivElement>) => {
+    if (
+      renderJob.phase === "in_progress" ||
+      assetUploadBusy ||
+      projectActionBusy ||
+      !activeProjectId ||
+      hydratedProjectId !== activeProjectId
+    ) return;
     const amount = event.shiftKey ? 0.02 : 0.005;
     const delta = {
       ArrowLeft: [-amount, 0],
@@ -967,24 +1170,29 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
     }[event.key];
     if (!delta) return;
     event.preventDefault();
-    setTitle((current) => ({
-      ...current,
-      x: Math.min(0.82, Math.max(0.02, current.x + delta[0])),
-      y: Math.min(0.84, Math.max(0.13, current.y + delta[1])),
-    }));
+    setSelectedLayerId(layerId);
+    setLayers((current) => current.map((layer) =>
+      layer.id === layerId
+        ? positionLayer(layer, layer.x + delta[0], layer.y + delta[1])
+        : layer,
+    ));
   };
 
   const renderVideo = async () => {
-    if (!videoUrl) return;
+    if (
+      !videoUrl ||
+      renderJob.phase === "in_progress" ||
+      assetUploadBusy ||
+      projectActionBusy ||
+      !activeProjectId ||
+      hydratedProjectId !== activeProjectId
+    ) return;
     setRenderJob({ phase: "in_progress" });
     try {
       const form = new FormData();
       form.append("projectId", activeProjectId);
       form.append("videoUrl", videoUrl);
-      form.append("title", title.text);
-      form.append("titleX", String(title.x));
-      form.append("titleY", String(title.y));
-      form.append("fontSize", String(title.fontSize));
+      form.append("composition", JSON.stringify({ version: 1, layers }));
       form.append("musicVolume", String(musicVolume));
       if (music) form.append("music", music, music.name);
 
@@ -1011,10 +1219,17 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
   const imageBusy = ["submitting", "queued", "in_progress"].includes(imageJob.phase);
   const videoBusy = ["submitting", "queued", "in_progress"].includes(videoJob.phase);
   const renderBusy = renderJob.phase === "in_progress";
+  const compositionEditingDisabled =
+    renderBusy ||
+    assetUploadBusy ||
+    projectActionBusy ||
+    !activeProjectId ||
+    hydratedProjectId !== activeProjectId;
   const workspaceBusy =
     imageBusy ||
     videoBusy ||
     renderBusy ||
+    assetUploadBusy ||
     projectActionBusy ||
     !activeProjectId ||
     hydratedProjectId !== activeProjectId;
@@ -1375,49 +1590,22 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
               <div className="panel-heading compact-heading">
                 <span className="eyebrow">03 · COMPOSE</span>
                 <h1 className="sr-only">Make it unmistakably yours.</h1>
-                <p>Add the branded frame, position your title, mix music, and export.</p>
+                <p>Add text and images, arrange every layer, mix music, and export.</p>
               </div>
 
-              <section className="control-section">
-                <div className="section-title"><Type size={16} /><strong>Title</strong></div>
-                <label className="field-label" htmlFor="title-text">
-                  Copy <span>{title.text.length}/180</span>
-                </label>
-                <textarea
-                  className="small-textarea"
-                  id="title-text"
-                  maxLength={180}
-                  onChange={(event) =>
-                    setTitle((current) => ({ ...current, text: event.target.value }))
-                  }
-                  rows={3}
-                  value={title.text}
-                />
-                <div className="slider-row">
-                  <label htmlFor="font-size">Size</label>
-                  <input
-                    id="font-size"
-                    max="132"
-                    min="48"
-                    onChange={(event) =>
-                      setTitle((current) => ({
-                        ...current,
-                        fontSize: Number(event.target.value),
-                      }))
-                    }
-                    type="range"
-                    value={title.fontSize}
-                  />
-                  <output>{title.fontSize}px</output>
-                </div>
-                <button
-                  className="text-button"
-                  onClick={() => setTitle((current) => ({ ...DEFAULT_TITLE, text: current.text }))}
-                  type="button"
-                >
-                  <RotateCcw size={14} /> Reset title position
-                </button>
-              </section>
+              <CompositionEditor
+                disabled={compositionEditingDisabled}
+                layers={layers}
+                onAddText={addTextLayer}
+                onChangeLayer={updateLayer}
+                onDeleteLayer={deleteLayer}
+                onReorderLayers={(nextLayers) => setLayers([...nextLayers])}
+                onRestoreLogo={restoreDefaultLogo}
+                onSelectLayer={setSelectedLayerId}
+                onUploadImage={addImageLayer}
+                onUploadLogo={replaceLogo}
+                selectedLayerId={selectedLayerId}
+              />
 
               <section className="control-section">
                 <div className="section-title"><Music2 size={16} /><strong>Background music</strong></div>
@@ -1474,7 +1662,7 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
               <JobMessage job={renderJob} />
               <button
                 className="primary-button export-button"
-                disabled={renderBusy}
+                disabled={compositionEditingDisabled}
                 onClick={renderVideo}
                 type="button"
               >
@@ -1487,7 +1675,7 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
               <div className="preview-toolbar">
                 <div>
                   <span className="toolbar-kicker">FINAL CANVAS</span>
-                  <strong>Drag the title to position it</strong>
+                  <strong>Drag any layer to position it</strong>
                 </div>
                 <div className="toolbar-actions">
                   <span className="dimension-pill">1080 × 1350</span>
@@ -1513,40 +1701,119 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
                   />
                   {/* eslint-disable-next-line @next/next/no-img-element */}
                   <img alt="" aria-hidden="true" className="frame-overlay" src="/frame-overlay.svg" />
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img
-                    alt="GoStudy.hk"
-                    className="canvas-brand-logo"
-                    src="/gostudy-logo.svg"
-                    style={{
-                      left: `${(BRAND_LOGO_RECT.x / OUTPUT_SIZE.width) * 100}%`,
-                      top: `${(BRAND_LOGO_RECT.y / OUTPUT_SIZE.height) * 100}%`,
-                      width: `${(BRAND_LOGO_RECT.width / OUTPUT_SIZE.width) * 100}%`,
-                      height: `${(BRAND_LOGO_RECT.height / OUTPUT_SIZE.height) * 100}%`,
-                    }}
-                  />
-                  <div
-                    aria-label="Draggable video title. Use arrow keys to move."
-                    className="draggable-title"
-                    onKeyDown={nudgeTitle}
-                    onPointerCancel={() => { dragRef.current = null; }}
-                    onPointerDown={startTitleDrag}
-                    onPointerMove={moveTitle}
-                    onPointerUp={() => { dragRef.current = null; }}
-                    role="button"
-                    style={
-                      {
-                        left: `${title.x * 100}%`,
-                        top: `${title.y * 100}%`,
-                        maxWidth: `${Math.max(12, (0.95 - title.x) * 100)}%`,
-                        fontSize: `${title.fontSize / 10.8}cqw`,
-                      } as CSSProperties
+                  {layers.map((layer, index) => {
+                    const sharedProps = {
+                      "aria-label": `${layer.name}. Drag or use arrow keys to move.`,
+                      "aria-disabled": compositionEditingDisabled,
+                      className: `canvas-layer ${
+                        layer.type === "text" ? "canvas-text-layer" : "canvas-image-layer"
+                      } ${selectedLayerId === layer.id ? "is-selected" : ""} ${
+                        compositionEditingDisabled ? "is-disabled" : ""
+                      }`,
+                      onFocus: () => setSelectedLayerId(layer.id),
+                      onKeyDown: (event: KeyboardEvent<HTMLDivElement>) => nudgeLayer(layer.id, event),
+                      onPointerCancel: () => { dragRef.current = null; },
+                      onPointerDown: (event: PointerEvent<HTMLDivElement>) => startLayerDrag(layer, event),
+                      onPointerMove: moveLayerOnCanvas,
+                      onPointerUp: () => { dragRef.current = null; },
+                      role: "group",
+                      tabIndex: compositionEditingDisabled ? -1 : 0,
+                    } as const;
+
+                    if (layer.type === "image") {
+                      return (
+                        <div
+                          key={layer.id}
+                          {...sharedProps}
+                          style={{
+                            left: `${layer.x * 100}%`,
+                            top: `${layer.y * 100}%`,
+                            width: `${layer.width * 100}%`,
+                            height: `${imageLayerHeight(layer) * 100}%`,
+                            zIndex: index + 3,
+                          }}
+                        >
+                          {/* Project-owned image URLs are dynamic, so a native image is intentional. */}
+                          {/* eslint-disable-next-line @next/next/no-img-element */}
+                          <img
+                            alt=""
+                            aria-hidden="true"
+                            className={layer.mask === "circle" ? "is-circle" : ""}
+                            draggable={false}
+                            src={layer.src}
+                          />
+                          <span className="drag-handle"><Move size={11} /></span>
+                        </div>
+                      );
                     }
-                    tabIndex={0}
-                  >
-                    {title.text || "Add a title"}
-                    <span className="drag-handle"><Move size={11} /></span>
-                  </div>
+
+                    const previewLines = wrappedTextLines(layer);
+                    const previewWidth = Math.round(
+                      clampNumber(layer.width, 0.12, 0.96) * OUTPUT_SIZE.width,
+                    );
+                    const previewFontSize = Math.round(clampNumber(layer.fontSize, 18, 180));
+                    const previewLineHeight = Math.round(previewFontSize * 1.08);
+                    const previewHeight = Math.max(
+                      previewLineHeight,
+                      previewLines.length * previewLineHeight,
+                    );
+                    const previewTextX = layer.textAlign === "center"
+                      ? Math.round(previewWidth / 2)
+                      : layer.textAlign === "right"
+                        ? previewWidth
+                        : 0;
+                    const previewAnchor = layer.textAlign === "center"
+                      ? "middle"
+                      : layer.textAlign === "right"
+                        ? "end"
+                        : "start";
+                    return (
+                      <div
+                        key={layer.id}
+                        {...sharedProps}
+                        style={
+                          {
+                            left: `${Math.round(layer.x * OUTPUT_SIZE.width) / 10.8}%`,
+                            top: `${Math.round(layer.y * OUTPUT_SIZE.height) / 13.5}%`,
+                            width: `${previewWidth / 10.8}%`,
+                            height: `${previewHeight / 13.5}%`,
+                            zIndex: index + 3,
+                          }
+                        }
+                      >
+                        <svg
+                          aria-hidden="true"
+                          viewBox={`0 0 ${previewWidth} ${previewHeight}`}
+                        >
+                          <text
+                            dominantBaseline="hanging"
+                            fill={layer.color}
+                            fontFamily={FONT_FAMILIES[layer.fontFamily]}
+                            fontSize={previewFontSize}
+                            fontWeight={layer.fontWeight}
+                            paintOrder="stroke fill"
+                            stroke={layer.strokeColor}
+                            strokeLinejoin="round"
+                            strokeWidth={Math.round(layer.strokeWidth)}
+                            textAnchor={previewAnchor}
+                            x={previewTextX}
+                            y="0"
+                          >
+                            {previewLines.map((line, lineIndex) => (
+                              <tspan
+                                dy={lineIndex === 0 ? 0 : previewLineHeight}
+                                key={`${layer.id}-${lineIndex}`}
+                                x={previewTextX}
+                              >
+                                {line}
+                              </tspan>
+                            ))}
+                          </text>
+                        </svg>
+                        <span className="drag-handle"><Move size={11} /></span>
+                      </div>
+                    );
+                  })}
                   <button
                     aria-label={isPlaying ? "Pause video preview" : "Play video preview"}
                     className={`canvas-play ${isPlaying ? "is-playing" : ""}`}
@@ -1557,7 +1824,7 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
                   </button>
                 </div>
                 <div className="canvas-caption">
-                  <span><Move size={14} /> Drag or use arrow keys to move the title</span>
+                  <span><Move size={14} /> Drag or use arrow keys to move the selected layer</span>
                   <span>4:5 social · H.264 MP4</span>
                 </div>
               </div>

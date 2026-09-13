@@ -32,6 +32,11 @@ async function temporaryStore(options: ConstructorParameters<typeof ProjectStore
 }
 
 function completeSnapshot(prompt = "An editorial portrait"): StudioSnapshot {
+  const layers = createEmptyStudioSnapshot().layers.map((layer) =>
+    layer.type === "text"
+      ? { ...layer, text: "A saved title", x: 0.1, y: 0.3, fontSize: 72 }
+      : layer,
+  );
   return {
     ...createEmptyStudioSnapshot(),
     step: 3,
@@ -48,7 +53,7 @@ function completeSnapshot(prompt = "An editorial portrait"): StudioSnapshot {
     duration: 8,
     resolution: "1080",
     cameraFixed: true,
-    title: { text: "A saved title", x: 0.2, y: 0.3, fontSize: 72 },
+    layers,
     musicVolume: 0.35,
   };
 }
@@ -150,16 +155,29 @@ describe("per-owner project persistence", () => {
     expect(await store.get(OWNER_A, "legacy-v1")).toMatchObject({
       name: "Legacy project",
       snapshot: {
+        version: 2,
         step: 1,
         imagePrompt: "x".repeat(4_000),
         motionPrompt: "",
         duration: 5,
         resolution: "720",
         cameraFixed: false,
-        title: { text: "Your story starts here", x: 0.02, y: 0.84, fontSize: 132 },
+        layers: [
+          { id: "brand-logo", type: "image", role: "logo", src: "/gostudy-logo.svg" },
+          {
+            id: "text-1",
+            type: "text",
+            text: "Your story starts here",
+            x: 0.02,
+            fontSize: 132,
+          },
+        ],
         musicVolume: 1,
       },
     });
+    const migrated = await store.get(OWNER_A, "legacy-v1");
+    expect(migrated.snapshot.layers[1]).toMatchObject({ type: "text", x: 0.02 });
+    expect(migrated.snapshot.layers[1]?.y).toBeCloseTo(0.7888);
 
     const newer = {
       ...browserProject,
@@ -187,10 +205,25 @@ describe("per-owner project persistence", () => {
       { ...valid, duration: 6 },
       { ...valid, resolution: "4k" },
       { ...valid, cameraFixed: 1 },
-      { ...valid, title: { ...valid.title, text: "x".repeat(181) } },
-      { ...valid, title: { ...valid.title, x: 0.01 } },
-      { ...valid, title: { ...valid.title, y: 0.85 } },
-      { ...valid, title: { ...valid.title, fontSize: 133 } },
+      {
+        ...valid,
+        layers: valid.layers.map((layer) =>
+          layer.type === "text" ? { ...layer, text: "x".repeat(501) } : layer,
+        ),
+      },
+      {
+        ...valid,
+        layers: valid.layers.map((layer) =>
+          layer.type === "text" ? { ...layer, x: 1 } : layer,
+        ),
+      },
+      {
+        ...valid,
+        layers: valid.layers.map((layer) =>
+          layer.type === "text" ? { ...layer, fontSize: 181 } : layer,
+        ),
+      },
+      { ...valid, layers: [...valid.layers, ...valid.layers] },
       { ...valid, musicVolume: 1.01 },
     ];
     for (const snapshot of invalidSnapshots) {

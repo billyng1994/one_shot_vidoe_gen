@@ -80,6 +80,7 @@ RUN apt-get update \
     ca-certificates \
     dumb-init \
     ffmpeg \
+    fonts-liberation2 \
     fonts-noto-cjk \
   && rm -rf /var/lib/apt/lists/*
 

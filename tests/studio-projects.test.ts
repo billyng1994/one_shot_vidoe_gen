@@ -86,8 +86,15 @@ describe("project documents", () => {
     const first = createEmptyStudioSnapshot();
     const second = createEmptyStudioSnapshot();
 
-    first.title.text = "Changed";
-    expect(second.title.text).toBe("Your story starts here");
+    const firstText = first.layers.find((layer) => layer.type === "text");
+    const secondText = second.layers.find((layer) => layer.type === "text");
+    if (!firstText || !secondText) throw new Error("Default text layer is missing.");
+
+    firstText.text = "Changed";
+    first.layers.reverse();
+
+    expect(secondText.text).toBe("Your story starts here");
+    expect(second.layers.map((layer) => layer.id)).toEqual(["brand-logo", "text-1"]);
   });
 
   it("updates a snapshot without mutating the original project", () => {

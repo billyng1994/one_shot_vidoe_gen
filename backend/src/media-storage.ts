@@ -8,15 +8,19 @@ import {
   rename,
   rm,
   stat,
+  writeFile,
 } from "node:fs/promises";
 import { isIP } from "node:net";
 import { basename, extname, join, resolve, sep } from "node:path";
+
+import sharp from "sharp";
 
 import { BackendError } from "./errors.js";
 import type { StoredMedia } from "./job-store.js";
 import {
   assertProjectId,
   mediaRelativePath,
+  mediaUrl,
   parseBackendRequestId,
   parseMediaRelativePath,
   type GenerationKind,
@@ -28,6 +32,8 @@ type Lookup = typeof dnsLookup;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const MAX_REDIRECTS = 4;
 const DOWNLOAD_TIMEOUT_MS = 90_000;
+const MAX_UPLOADED_IMAGE_PIXELS = 40_000_000;
+const UPLOAD_IMAGE_FORMATS = new Set(["avif", "jpeg", "png", "webp"]);
 
 const MIME_BY_EXTENSION: Record<string, string> = {
   ".avif": "image/avif",
@@ -359,6 +365,75 @@ export class MediaStorage {
     } finally {
       await rm(temporary, { force: true }).catch(() => undefined);
     }
+  }
+
+  async storeUploadedImage(input: { projectId: string; bytes: Buffer }) {
+    assertProjectId(input.projectId);
+    if (input.bytes.byteLength === 0) {
+      throw new BackendError("Choose an image to upload.", 400, "EMPTY_IMAGE_UPLOAD");
+    }
+    if (input.bytes.byteLength > this.limits.image) {
+      throw new BackendError("The uploaded image is too large.", 413, "IMAGE_TOO_LARGE");
+    }
+
+    let normalized: { data: Buffer; info: { width: number; height: number } };
+    try {
+      const source = sharp(input.bytes, {
+        animated: false,
+        failOn: "error",
+        limitInputPixels: MAX_UPLOADED_IMAGE_PIXELS,
+      });
+      const metadata = await source.metadata();
+      if (
+        !metadata.format ||
+        !UPLOAD_IMAGE_FORMATS.has(metadata.format) ||
+        !metadata.width ||
+        !metadata.height ||
+        (metadata.pages ?? 1) !== 1
+      ) {
+        throw new BackendError(
+          "Upload a PNG, JPEG, WebP, or AVIF image.",
+          400,
+          "INVALID_IMAGE_UPLOAD",
+        );
+      }
+      normalized = await source
+        .rotate()
+        .png({ adaptiveFiltering: true, compressionLevel: 9 })
+        .toBuffer({ resolveWithObject: true });
+    } catch (error) {
+      if (error instanceof BackendError) throw error;
+      throw new BackendError(
+        "The uploaded image could not be decoded.",
+        400,
+        "INVALID_IMAGE_UPLOAD",
+      );
+    }
+    if (normalized.data.byteLength > this.limits.image) {
+      throw new BackendError(
+        "The normalized image is too large.",
+        413,
+        "IMAGE_TOO_LARGE",
+      );
+    }
+
+    const directory = await this.categoryDirectory(input.projectId, "image");
+    const filename = `overlay-${randomUUID()}.png`;
+    const relativePath = mediaRelativePath(input.projectId, "images", filename);
+    const destination = join(directory, filename);
+    const temporary = join(directory, `.${filename}.${randomUUID()}.tmp`);
+    try {
+      await writeFile(temporary, normalized.data, { flag: "wx", mode: 0o600 });
+      await rename(temporary, destination);
+    } finally {
+      await rm(temporary, { force: true }).catch(() => undefined);
+    }
+
+    return {
+      url: mediaUrl(relativePath),
+      width: normalized.info.width,
+      height: normalized.info.height,
+    };
   }
 
   async resolveFile(relativePath: string) {

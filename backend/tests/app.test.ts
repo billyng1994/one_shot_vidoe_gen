@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 
 import request from "supertest";
 import { afterEach, describe, expect, it } from "vitest";
+import sharp from "sharp";
 
 import { createBackendRuntime } from "../src/app.js";
 import type { BackendConfig } from "../src/config.js";
@@ -190,7 +191,7 @@ describe("Express backend API", () => {
     expect(created.body).toMatchObject({
       version: 2,
       name: "Backend project",
-      snapshot: { version: 1, step: 1 },
+      snapshot: { version: 2, step: 1 },
     });
     const projectId = created.body.id as string;
     const updatedSnapshot = {
@@ -422,5 +423,89 @@ describe("Express backend API", () => {
       .field("title", "Safe title")
       .expect(400);
     expect(render.body.error).toMatch(/backend-managed media/);
+  });
+
+  it("accepts only authenticated project-owned raster overlay uploads", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "backend-upload-test-"));
+    temporaryDirectories.push(dataDir);
+    const runtime = createBackendRuntime(config(dataDir));
+    await runtime.initialize();
+    const adminAgent = request.agent(runtime.app);
+    const admin = await bootstrap(adminAgent);
+    const project = await createProject(adminAgent, admin.csrfToken, "Overlay uploads");
+    const projectId = project.body.id as string;
+    const jpeg = await sharp({
+      create: { width: 12, height: 8, channels: 3, background: "#396dc8" },
+    }).jpeg().toBuffer();
+
+    await request(runtime.app)
+      .post(`/api/projects/${projectId}/assets`)
+      .attach("image", jpeg, { filename: "overlay.jpg", contentType: "image/jpeg" })
+      .expect(401, { error: "Authentication is required.", code: "AUTH_REQUIRED" });
+    await adminAgent
+      .post(`/api/projects/${projectId}/assets`)
+      .set("X-OneTake-Request", "1")
+      .attach("image", jpeg, { filename: "overlay.jpg", contentType: "image/jpeg" })
+      .expect(403, { error: "The request could not be verified.", code: "CSRF_INVALID" });
+
+    const uploaded = await browserMutation(
+      adminAgent.post(`/api/projects/${projectId}/assets`),
+      admin.csrfToken,
+    )
+      .attach("image", jpeg, { filename: "overlay.jpg", contentType: "image/jpeg" });
+    expect(uploaded.status, JSON.stringify(uploaded.body)).toBe(201);
+    expect(uploaded.body).toMatchObject({ width: 12, height: 8 });
+    expect(uploaded.body.url).toMatch(
+      new RegExp(`^/media/${projectId}/images/overlay-[0-9a-f-]+\\.png$`),
+    );
+
+    const stored = await adminAgent.get(uploaded.body.url as string).expect(200);
+    expect(stored.headers["content-type"]).toMatch(/^image\/png/);
+    expect(await sharp(stored.body as Buffer).metadata()).toMatchObject({
+      format: "png",
+      width: 12,
+      height: 8,
+    });
+
+    const snapshot = {
+      ...project.body.snapshot,
+      layers: [
+        ...project.body.snapshot.layers,
+        {
+          id: "image-uploaded",
+          type: "image",
+          role: "overlay",
+          name: "Uploaded image",
+          src: uploaded.body.url,
+          x: 0.2,
+          y: 0.3,
+          width: 0.3,
+          aspectRatio: 1.5,
+          mask: "circle",
+        },
+      ],
+    };
+    await browserMutation(
+      adminAgent.patch(`/api/projects/${projectId}`),
+      admin.csrfToken,
+    )
+      .send({ snapshot })
+      .expect(200)
+      .expect(({ body }) => expect(body.snapshot.layers.at(-1)).toMatchObject({
+        id: "image-uploaded",
+        src: uploaded.body.url,
+        mask: "circle",
+      }));
+
+    await browserMutation(
+      adminAgent.post(`/api/projects/${projectId}/assets`),
+      admin.csrfToken,
+    )
+      .attach("image", Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>'), {
+        filename: "unsafe.svg",
+        contentType: "image/svg+xml",
+      })
+      .expect(400)
+      .expect(({ body }) => expect(body).toMatchObject({ code: "INVALID_IMAGE_UPLOAD" }));
   });
 });

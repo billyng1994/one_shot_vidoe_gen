@@ -3,7 +3,9 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
+import sharp from "sharp";
 
+import { defaultCompositionLayers, type ImageLayer } from "../src/composition.js";
 import { MediaStorage } from "../src/media-storage.js";
 import { RenderService, type CommandRunner } from "../src/render-service.js";
 
@@ -65,5 +67,89 @@ describe("render service", () => {
       expect.arrayContaining(["-f", "mp4"]),
       5 * 60_000,
     );
+  });
+
+  it("paints image layers bottom-to-top and applies a circular mask", async () => {
+    const dataDirectory = await mkdtemp(join(tmpdir(), "backend-render-layers-test-"));
+    temporaryDirectories.push(dataDirectory);
+    const assetsDirectory = resolve(import.meta.dirname, "..", "assets");
+    const media = new MediaStorage(
+      dataDirectory,
+      assetsDirectory,
+      { image: 5 * 1024 * 1024, video: 5 * 1024 * 1024 },
+    );
+    await media.initialize();
+    const red = await media.storeUploadedImage({
+      projectId: PROJECT_ID,
+      bytes: await sharp({
+        create: { width: 40, height: 40, channels: 3, background: "#ff0000" },
+      }).png().toBuffer(),
+    });
+    const blue = await media.storeUploadedImage({
+      projectId: PROJECT_ID,
+      bytes: await sharp({
+        create: { width: 40, height: 40, channels: 3, background: "#0000ff" },
+      }).png().toBuffer(),
+    });
+    let renderedOverlay: Buffer | undefined;
+    const runner = vi.fn<CommandRunner>(async (binary, args) => {
+      if (binary === "test-ffprobe") return { stdout: "5.0\n", stderr: "" };
+      const inputPaths = args.flatMap((argument, index) =>
+        argument === "-i" && args[index + 1] ? [args[index + 1]!] : [],
+      );
+      renderedOverlay = await readFile(inputPaths[1]!);
+      await writeFile(args.at(-1)!, Buffer.from("fake-mp4-output"));
+      return { stdout: "", stderr: "" };
+    });
+    const renderer = new RenderService(
+      media,
+      assetsDirectory,
+      {
+        concurrency: 1,
+        ffmpegPath: "test-ffmpeg",
+        ffprobePath: "test-ffprobe",
+        maxMusicBytes: 1024,
+        maxVideoBytes: 1024 * 1024,
+      },
+      runner,
+    );
+    const imageLayer = (id: string, src: string, mask: ImageLayer["mask"]): ImageLayer => ({
+      id,
+      type: "image",
+      role: "overlay",
+      name: id,
+      src,
+      x: 0.2,
+      y: 0.3,
+      width: 0.2,
+      aspectRatio: 1,
+      mask,
+    });
+
+    await renderer.render({
+      fields: {
+        projectId: PROJECT_ID,
+        videoUrl: "/media/samples/demo-video.mp4",
+        composition: JSON.stringify({
+          version: 1,
+          layers: [
+            defaultCompositionLayers()[0],
+            imageLayer("red-image", red.url, "none"),
+            imageLayer("blue-image", blue.url, "circle"),
+          ],
+        }),
+      },
+    });
+
+    expect(renderedOverlay).toBeDefined();
+    const { data, info } = await sharp(renderedOverlay!).ensureAlpha().raw().toBuffer({
+      resolveWithObject: true,
+    });
+    const pixel = (x: number, y: number) => {
+      const offset = (y * info.width + x) * info.channels;
+      return [...data.subarray(offset, offset + 4)];
+    };
+    expect(pixel(324, 513)).toEqual([0, 0, 255, 255]);
+    expect(pixel(219, 408)).toEqual([255, 0, 0, 255]);
   });
 });

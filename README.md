@@ -4,7 +4,7 @@ OneTake is a three-stage social-video workflow:
 
 1. Generate a square first frame with Higgsfield CLI and GPT Image 2.
 2. Use that image job as frame one for Seedance 2.0.
-3. Add the GoStudy frame, title, and optional music, then render an H.264 MP4.
+3. Compose layered text, logos, overlay images, and optional music, then render an H.264 MP4.
 
 ## Architecture and storage
 
@@ -275,6 +275,7 @@ first obtain the CSRF token from `GET /api/auth/session` while retaining the ses
 | User | `GET /api/projects` | List the current user's projects |
 | User | `POST /api/projects` | Create a project |
 | User | `GET/PATCH/DELETE /api/projects/{projectId}` | Read, save, or delete an owned project |
+| User | `POST /api/projects/{projectId}/assets` | Normalize and store an owned composition image |
 | User | `POST /api/generations/image` | Submit an image generation for an owned project |
 | User | `POST /api/generations/video` | Submit a video using a completed image job |
 | User | `GET /api/generations/{requestId}` | Read an owned durable job and local media URL |

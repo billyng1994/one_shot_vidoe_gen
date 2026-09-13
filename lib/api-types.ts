@@ -43,3 +43,9 @@ export type RenderResponse = {
   url: string;
   filename: string;
 };
+
+export type OverlayUploadResponse = {
+  url: string;
+  width: number;
+  height: number;
+};

@@ -276,7 +276,7 @@ export class ProjectStore {
         ...(input.source ? { source: input.source } : {}),
         snapshot: input.snapshot === undefined
           ? createEmptyStudioSnapshot()
-          : validateStudioSnapshot(input.snapshot),
+          : validateStudioSnapshot(input.snapshot, id),
       });
     });
   }
@@ -298,7 +298,7 @@ export class ProjectStore {
       const updated: StudioProject = {
         ...current,
         name: hasName ? normalizeProjectName(input.name, current.name) : current.name,
-        snapshot: hasSnapshot ? validateStudioSnapshot(input.snapshot) : current.snapshot,
+        snapshot: hasSnapshot ? validateStudioSnapshot(input.snapshot, projectId) : current.snapshot,
         updatedAt: this.now(),
       };
       return this.atomicWrite(ownerId, updated);

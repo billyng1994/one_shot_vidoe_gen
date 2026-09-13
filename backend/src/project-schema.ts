@@ -1,8 +1,18 @@
 import { BackendError } from "./errors.js";
+import {
+  DEFAULT_TITLE,
+  defaultCompositionLayers,
+  legacyCompositionLayers,
+  validateCompositionLayers,
+  type CompositionLayer,
+  type TitlePlacement,
+} from "./composition.js";
 import { UUID_PATTERN, assertProjectId } from "./validation.js";
 
+export type { CompositionLayer, TitlePlacement } from "./composition.js";
+
 export const PROJECT_DOCUMENT_VERSION = 2 as const;
-export const STUDIO_SNAPSHOT_VERSION = 1 as const;
+export const STUDIO_SNAPSHOT_VERSION = 2 as const;
 export const LEGACY_PROJECT_ID = "legacy-v1";
 export const MAX_PROJECTS_PER_OWNER = 50;
 
@@ -11,15 +21,8 @@ export type PersistedAsset = {
   url: string;
 };
 
-export type TitlePlacement = {
-  text: string;
-  x: number;
-  y: number;
-  fontSize: number;
-};
-
 export type StudioSnapshot = {
-  version: 1;
+  version: 2;
   step: 1 | 2 | 3;
   imagePrompt: string;
   motionPrompt: string;
@@ -28,7 +31,7 @@ export type StudioSnapshot = {
   duration: 5 | 8 | 10;
   resolution: "720" | "1080";
   cameraFixed: boolean;
-  title: TitlePlacement;
+  layers: CompositionLayer[];
   musicVolume: number;
 };
 
@@ -40,13 +43,6 @@ export type StudioProject = {
   updatedAt: string;
   source?: "legacy-studio-v1";
   snapshot: StudioSnapshot;
-};
-
-const DEFAULT_TITLE: TitlePlacement = {
-  text: "Your story starts here",
-  x: 0.055,
-  y: 0.165,
-  fontSize: 86,
 };
 
 const REQUEST_ID_PATTERNS = {
@@ -116,6 +112,55 @@ function normalizedAsset(value: unknown, kind: "image" | "video"): PersistedAsse
   };
 }
 
+function validateLegacyTitle(value: unknown): TitlePlacement {
+  const title = record(value);
+  if (!title) invalid("The title placement must be an object.", "INVALID_PROJECT_SNAPSHOT");
+  if (typeof title.text !== "string" || title.text.length > 180) {
+    invalid("The title must be at most 180 characters.", "INVALID_PROJECT_SNAPSHOT");
+  }
+  if (typeof title.x !== "number" || !Number.isFinite(title.x) || title.x < 0.02 || title.x > 0.82) {
+    invalid("The title x position is out of range.", "INVALID_PROJECT_SNAPSHOT");
+  }
+  if (typeof title.y !== "number" || !Number.isFinite(title.y) || title.y < 0.13 || title.y > 0.84) {
+    invalid("The title y position is out of range.", "INVALID_PROJECT_SNAPSHOT");
+  }
+  if (
+    typeof title.fontSize !== "number" ||
+    !Number.isFinite(title.fontSize) ||
+    title.fontSize < 48 ||
+    title.fontSize > 132
+  ) {
+    invalid("The title font size is out of range.", "INVALID_PROJECT_SNAPSHOT");
+  }
+  return {
+    text: title.text,
+    x: title.x,
+    y: title.y,
+    fontSize: title.fontSize,
+  };
+}
+
+function normalizeLegacyTitle(value: unknown): TitlePlacement {
+  const title = record(value);
+  return {
+    text: boundedString(title?.text, 180) || DEFAULT_TITLE.text,
+    x: clamp(finiteNumber(title?.x, DEFAULT_TITLE.x), 0.02, 0.82),
+    y: clamp(finiteNumber(title?.y, DEFAULT_TITLE.y), 0.13, 0.84),
+    fontSize: clamp(finiteNumber(title?.fontSize, DEFAULT_TITLE.fontSize), 48, 132),
+  };
+}
+
+function normalizeCompositionLayers(value: unknown, expectedProjectId?: string) {
+  try {
+    return validateCompositionLayers(value, {
+      code: "INVALID_PROJECT_IMPORT",
+      projectId: expectedProjectId,
+    });
+  } catch {
+    return defaultCompositionLayers();
+  }
+}
+
 function validateAsset(value: unknown, kind: "image" | "video"): PersistedAsset {
   const candidate = record(value);
   if (!candidate) invalid(`The ${kind} asset must be an object.`, "INVALID_PROJECT_SNAPSHOT");
@@ -154,7 +199,7 @@ export function createEmptyStudioSnapshot(): StudioSnapshot {
     duration: 5,
     resolution: "720",
     cameraFixed: false,
-    title: { ...DEFAULT_TITLE },
+    layers: defaultCompositionLayers(),
     musicVolume: 0.24,
   };
 }
@@ -163,9 +208,9 @@ export function createEmptyStudioSnapshot(): StudioSnapshot {
  * Strict validation for API input and durable records. The limits intentionally
  * match lib/studio-state.ts in the frontend.
  */
-export function validateStudioSnapshot(value: unknown): StudioSnapshot {
+export function validateStudioSnapshot(value: unknown, expectedProjectId?: string): StudioSnapshot {
   const candidate = record(value);
-  if (!candidate || candidate.version !== STUDIO_SNAPSHOT_VERSION) {
+  if (!candidate || (candidate.version !== 1 && candidate.version !== STUDIO_SNAPSHOT_VERSION)) {
     invalid("The project snapshot version is invalid.", "INVALID_PROJECT_SNAPSHOT");
   }
   if (candidate.step !== 1 && candidate.step !== 2 && candidate.step !== 3) {
@@ -196,24 +241,15 @@ export function validateStudioSnapshot(value: unknown): StudioSnapshot {
     invalid("The camera-fixed setting must be a boolean.", "INVALID_PROJECT_SNAPSHOT");
   }
 
-  const title = record(candidate.title);
-  if (!title) invalid("The title placement must be an object.", "INVALID_PROJECT_SNAPSHOT");
-  if (typeof title.text !== "string" || title.text.length > 180) {
-    invalid("The title must be at most 180 characters.", "INVALID_PROJECT_SNAPSHOT");
-  }
-  if (typeof title.x !== "number" || !Number.isFinite(title.x) || title.x < 0.02 || title.x > 0.82) {
-    invalid("The title x position is out of range.", "INVALID_PROJECT_SNAPSHOT");
-  }
-  if (typeof title.y !== "number" || !Number.isFinite(title.y) || title.y < 0.13 || title.y > 0.84) {
-    invalid("The title y position is out of range.", "INVALID_PROJECT_SNAPSHOT");
-  }
-  if (
-    typeof title.fontSize !== "number" ||
-    !Number.isFinite(title.fontSize) ||
-    title.fontSize < 48 ||
-    title.fontSize > 132
-  ) {
-    invalid("The title font size is out of range.", "INVALID_PROJECT_SNAPSHOT");
+  let layers: CompositionLayer[];
+  if (candidate.version === 1) {
+    const title = validateLegacyTitle(candidate.title);
+    layers = legacyCompositionLayers(title);
+  } else {
+    layers = validateCompositionLayers(candidate.layers, {
+      code: "INVALID_PROJECT_SNAPSHOT",
+      projectId: expectedProjectId,
+    });
   }
   if (
     typeof candidate.musicVolume !== "number" ||
@@ -234,12 +270,7 @@ export function validateStudioSnapshot(value: unknown): StudioSnapshot {
     duration: candidate.duration,
     resolution: candidate.resolution,
     cameraFixed: candidate.cameraFixed,
-    title: {
-      text: title.text,
-      x: title.x,
-      y: title.y,
-      fontSize: title.fontSize,
-    },
+    layers,
     musicVolume: candidate.musicVolume,
   };
 }
@@ -248,15 +279,14 @@ export function validateStudioSnapshot(value: unknown): StudioSnapshot {
  * Compatibility parser for objects read from the existing browser localStorage.
  * It deliberately mirrors the frontend's recovery/defaulting behaviour.
  */
-export function normalizeLocalStudioSnapshot(value: unknown): StudioSnapshot {
+export function normalizeLocalStudioSnapshot(value: unknown, expectedProjectId?: string): StudioSnapshot {
   const candidate = parsedObject(value);
-  if (!candidate || candidate.version !== STUDIO_SNAPSHOT_VERSION) {
+  if (!candidate || (candidate.version !== 1 && candidate.version !== STUDIO_SNAPSHOT_VERSION)) {
     invalid("The imported project snapshot version is invalid.", "INVALID_PROJECT_IMPORT");
   }
 
   const image = normalizedAsset(candidate.image, "image");
   const video = normalizedAsset(candidate.video, "video");
-  const title = record(candidate.title);
   const requestedStep = candidate.step === 2 || candidate.step === 3 ? candidate.step : 1;
   const step = !image.url ? 1 : requestedStep === 3 && !video.url ? 2 : requestedStep;
 
@@ -270,12 +300,9 @@ export function normalizeLocalStudioSnapshot(value: unknown): StudioSnapshot {
     duration: candidate.duration === 8 || candidate.duration === 10 ? candidate.duration : 5,
     resolution: candidate.resolution === "1080" ? "1080" : "720",
     cameraFixed: candidate.cameraFixed === true,
-    title: {
-      text: boundedString(title?.text, 180) || DEFAULT_TITLE.text,
-      x: clamp(finiteNumber(title?.x, DEFAULT_TITLE.x), 0.02, 0.82),
-      y: clamp(finiteNumber(title?.y, DEFAULT_TITLE.y), 0.13, 0.84),
-      fontSize: clamp(finiteNumber(title?.fontSize, DEFAULT_TITLE.fontSize), 48, 132),
-    },
+    layers: candidate.version === 1
+      ? legacyCompositionLayers(normalizeLegacyTitle(candidate.title))
+      : normalizeCompositionLayers(candidate.layers, expectedProjectId),
     musicVolume: clamp(finiteNumber(candidate.musicVolume, 0.24), 0, 1),
   };
 }
@@ -306,7 +333,7 @@ export function validateStudioProject(value: unknown, expectedId?: string): Stud
     createdAt: candidate.createdAt,
     updatedAt: candidate.updatedAt,
     ...(candidate.source === "legacy-studio-v1" ? { source: candidate.source } : {}),
-    snapshot: validateStudioSnapshot(candidate.snapshot),
+    snapshot: validateStudioSnapshot(candidate.snapshot, id),
   };
 }
 
@@ -339,7 +366,7 @@ export function normalizeLocalStudioProject(value: unknown, expectedId?: string)
     ...(candidate.source === "legacy-studio-v1"
       ? { source: "legacy-studio-v1" as const }
       : {}),
-    snapshot: normalizeLocalStudioSnapshot(candidate.snapshot),
+    snapshot: normalizeLocalStudioSnapshot(candidate.snapshot, id),
   };
 }
 

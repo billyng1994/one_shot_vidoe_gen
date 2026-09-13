@@ -1,4 +1,4 @@
-import { DEFAULT_TITLE } from "./composition";
+import { createDefaultLayers } from "./composition";
 import {
   parseStudioSnapshot,
   serializeStudioSnapshot,
@@ -53,7 +53,7 @@ export function isProjectId(value: unknown): value is string {
 
 export function createEmptyStudioSnapshot(): StudioSnapshot {
   return {
-    version: 1,
+    version: 2,
     step: 1,
     imagePrompt: "",
     motionPrompt: "",
@@ -62,7 +62,7 @@ export function createEmptyStudioSnapshot(): StudioSnapshot {
     duration: 5,
     resolution: "720",
     cameraFixed: false,
-    title: { ...DEFAULT_TITLE },
+    layers: createDefaultLayers(),
     musicVolume: 0.24,
   };
 }

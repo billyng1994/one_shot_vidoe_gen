@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
+import sharp from "sharp";
 
 import { MediaStorage } from "../src/media-storage.js";
 
@@ -78,5 +79,34 @@ describe("provider media localization", () => {
       providerUrl: "https://cdn.example.test/huge.png",
       requestId: REQUEST_ID,
     })).rejects.toMatchObject({ status: 413, code: "MEDIA_TOO_LARGE" });
+  });
+
+  it("normalizes a project-owned upload to PNG", async () => {
+    const storage = await createStorage(vi.fn<typeof fetch>());
+    const jpeg = await sharp({
+      create: { width: 6, height: 4, channels: 3, background: "#e34a26" },
+    }).jpeg().toBuffer();
+
+    const uploaded = await storage.storeUploadedImage({ projectId: PROJECT_ID, bytes: jpeg });
+
+    expect(uploaded).toMatchObject({ width: 6, height: 4 });
+    expect(uploaded.url).toMatch(
+      new RegExp(`^/media/${PROJECT_ID}/images/overlay-[0-9a-f-]+\\.png$`),
+    );
+    const stored = await storage.resolveFile(uploaded.url.slice("/media/".length));
+    const metadata = await sharp(stored.path).metadata();
+    expect(metadata).toMatchObject({ format: "png", width: 6, height: 4 });
+  });
+
+  it("rejects undecodable and vector uploads", async () => {
+    const storage = await createStorage(vi.fn<typeof fetch>());
+    await expect(storage.storeUploadedImage({
+      projectId: PROJECT_ID,
+      bytes: Buffer.from("not an image"),
+    })).rejects.toMatchObject({ status: 400, code: "INVALID_IMAGE_UPLOAD" });
+    await expect(storage.storeUploadedImage({
+      projectId: PROJECT_ID,
+      bytes: Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>'),
+    })).rejects.toMatchObject({ status: 400, code: "INVALID_IMAGE_UPLOAD" });
   });
 });

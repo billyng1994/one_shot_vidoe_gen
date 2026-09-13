@@ -22,7 +22,7 @@ const nextConfig: NextConfig = {
   experimental: {
     // Generation submission may take 60 seconds and FFmpeg renders may take five minutes.
     proxyTimeout: 360_000,
-    // The backend accepts up to 40 MiB of music plus multipart framing.
+    // The backend accepts up to 40 MiB of music or 30 MiB composition images.
     proxyClientMaxBodySize: "48mb",
   },
   output: "standalone",

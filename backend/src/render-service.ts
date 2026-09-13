@@ -7,9 +7,18 @@ import { join } from "node:path";
 import sharp from "sharp";
 
 import {
-  BRAND_LOGO_RECT,
+  DEFAULT_LOGO_SRC,
+  MAX_IMAGE_ASPECT_RATIO,
+  MIN_IMAGE_LAYER_WIDTH,
+  MIN_IMAGE_ASPECT_RATIO,
+  OUTPUT_SIZE,
   clampNumber,
-  createOverlaySvg,
+  createFrameSvg,
+  createTextLayerSvg,
+  legacyCompositionLayers,
+  validateCompositionDocument,
+  type CompositionLayer,
+  type ImageLayer,
   type TitlePlacement,
 } from "./composition.js";
 import { BackendError } from "./errors.js";
@@ -200,11 +209,13 @@ export class RenderService {
     return duration;
   }
 
-  private async renderUnbounded(input: RenderInput) {
-    const projectId = input.fields.projectId;
-    assertProjectId(projectId);
+  private composition(input: RenderInput, projectId: string) {
+    if (input.fields.composition !== undefined) {
+      return validateCompositionDocument(input.fields.composition, { projectId }).layers;
+    }
+
     const titleText = typeof input.fields.title === "string" ? input.fields.title : "";
-    if (titleText.trim().length > 180) {
+    if (titleText.length > 180) {
       throw new BackendError("Title must be 180 characters or fewer.", 400, "INVALID_TITLE");
     }
     const title: TitlePlacement = {
@@ -213,6 +224,93 @@ export class RenderService {
       y: clampNumber(parseNumber(input.fields.titleY, 0.165), 0.13, 0.84),
       fontSize: clampNumber(parseNumber(input.fields.fontSize, 86), 48, 132),
     };
+    return legacyCompositionLayers(title);
+  }
+
+  private async imageLayerSource(layer: ImageLayer, projectId: string) {
+    if (layer.src === DEFAULT_LOGO_SRC) {
+      const logoPath = join(this.assetsDirectory, "gostudy-logo.svg");
+      return readFile(logoPath).catch((error) => {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          throw new BackendError("The render logo asset is missing.", 500, "MISSING_LOGO_ASSET");
+        }
+        throw error;
+      });
+    }
+    const parsed = parseLocalMediaUrl(layer.src, projectId);
+    return (await this.media.resolveFile(parsed.relativePath)).path;
+  }
+
+  private async imageLayerComposite(layer: ImageLayer, projectId: string) {
+    const source = await this.imageLayerSource(layer, projectId);
+    const left = Math.min(
+      OUTPUT_SIZE.width - 1,
+      Math.round(clampNumber(layer.x, 0, 1) * OUTPUT_SIZE.width),
+    );
+    const top = Math.min(
+      OUTPUT_SIZE.height - 1,
+      Math.round(clampNumber(layer.y, 0, 1) * OUTPUT_SIZE.height),
+    );
+    const width = Math.max(
+      1,
+      Math.round(clampNumber(layer.width, MIN_IMAGE_LAYER_WIDTH, 1) * OUTPUT_SIZE.width),
+    );
+    const height = layer.mask === "circle"
+      ? width
+      : Math.max(1, Math.round(width / clampNumber(
+          layer.aspectRatio,
+          MIN_IMAGE_ASPECT_RATIO,
+          MAX_IMAGE_ASPECT_RATIO,
+        )));
+    let image = await sharp(source, { limitInputPixels: 40_000_000 })
+      .rotate()
+      .resize({ width, height, fit: "cover" })
+      .ensureAlpha()
+      .png()
+      .toBuffer();
+
+    if (layer.mask === "circle") {
+      const radius = Math.min(width, height) / 2;
+      const mask = Buffer.from(`
+<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">
+  <circle cx="${width / 2}" cy="${height / 2}" r="${radius}" fill="#fff"/>
+</svg>`.trim());
+      image = await sharp(image)
+        .composite([{ input: mask, blend: "dest-in" }])
+        .png()
+        .toBuffer();
+    }
+
+    const visibleWidth = Math.min(width, OUTPUT_SIZE.width - left);
+    const visibleHeight = Math.min(height, OUTPUT_SIZE.height - top);
+    if (visibleWidth !== width || visibleHeight !== height) {
+      image = await sharp(image)
+        .extract({ left: 0, top: 0, width: visibleWidth, height: visibleHeight })
+        .png()
+        .toBuffer();
+    }
+    return { input: image, left, top };
+  }
+
+  private async createOverlay(layers: CompositionLayer[], projectId: string, destination: string) {
+    const composites: Array<{ input: Buffer; left: number; top: number }> = [];
+    for (const layer of layers) {
+      if (layer.type === "text") {
+        composites.push({ input: Buffer.from(createTextLayerSvg(layer)), left: 0, top: 0 });
+      } else {
+        composites.push(await this.imageLayerComposite(layer, projectId));
+      }
+    }
+    await sharp(Buffer.from(createFrameSvg()))
+      .composite(composites)
+      .png()
+      .toFile(destination);
+  }
+
+  private async renderUnbounded(input: RenderInput) {
+    const projectId = input.fields.projectId;
+    assertProjectId(projectId);
+    const layers = this.composition(input, projectId);
     const volume = clampNumber(parseNumber(input.fields.musicVolume, 0.24), 0, 1);
     const music = validateMusic(input.music, this.options.maxMusicBytes);
     const video = await this.resolveInputVideo(input.fields.videoUrl, projectId);
@@ -224,31 +322,7 @@ export class RenderService {
       workDirectory = await mkdtemp(join(tmpdir(), "one-shot-render-"));
       const overlayPath = join(workDirectory, "overlay.png");
       const musicPath = join(workDirectory, "music-input");
-      const logoPath = join(this.assetsDirectory, "gostudy-logo.svg");
-      const logoSource = await readFile(logoPath).catch((error) => {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-          throw new BackendError("The render logo asset is missing.", 500, "MISSING_LOGO_ASSET");
-        }
-        throw error;
-      });
-      const logo = await sharp(logoSource)
-        .resize({
-          width: BRAND_LOGO_RECT.width,
-          height: BRAND_LOGO_RECT.height,
-          fit: "fill",
-        })
-        .png()
-        .toBuffer();
-      await sharp(Buffer.from(createOverlaySvg(title)))
-        .composite([
-          {
-            input: logo,
-            left: BRAND_LOGO_RECT.x,
-            top: BRAND_LOGO_RECT.y,
-          },
-        ])
-        .png()
-        .toFile(overlayPath);
+      await this.createOverlay(layers, projectId, overlayPath);
 
       if (music) await writeFile(musicPath, music, { mode: 0o600 });
       const duration = await this.probeDuration(video.path);

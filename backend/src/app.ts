@@ -485,22 +485,56 @@ export function createApp(dependencies: AppDependencies): Express {
     }),
   );
 
-  const upload = multer({
+  const imageUpload = multer({
     storage: multer.memoryStorage(),
     limits: {
       fieldNameSize: 80,
-      fieldSize: 8 * 1024,
+      fields: 0,
+      fileSize: config.maxImageBytes,
+      files: 1,
+      parts: 2,
+    },
+  });
+  app.post(
+    "/api/projects/:projectId/assets",
+    requireAuthentication,
+    csrf,
+    asyncRoute(async (request, response, next) => {
+      const { projectId } = request.params;
+      assertProjectId(projectId);
+      await projects.get(requireAuthenticatedSession(response).user.id, projectId);
+      next();
+    }),
+    imageUpload.single("image"),
+    asyncRoute(async (request, response) => {
+      const { projectId } = request.params;
+      assertProjectId(projectId);
+      if (!request.file) {
+        throw new BackendError("Choose an image to upload.", 400, "IMAGE_REQUIRED");
+      }
+      response.status(201).json(await media.storeUploadedImage({
+        projectId,
+        bytes: request.file.buffer,
+      }));
+    }),
+  );
+
+  const renderUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: {
+      fieldNameSize: 80,
+      fieldSize: 64 * 1024,
       fields: 12,
       fileSize: config.maxMusicBytes,
       files: 1,
-      parts: 13,
+      parts: 14,
     },
   });
   app.post(
     "/api/render",
     requireAuthentication,
     csrf,
-    upload.single("music"),
+    renderUpload.single("music"),
     asyncRoute(async (request, response) => {
       const fields = request.body && typeof request.body === "object"
         ? (request.body as Record<string, unknown>)
@@ -612,7 +646,7 @@ export function createApp(dependencies: AppDependencies): Express {
     response.status(404).json({ error: "Route not found.", code: "NOT_FOUND" });
   });
 
-  app.use((error: unknown, _request: Request, response: Response, next: NextFunction) => {
+  app.use((error: unknown, request: Request, response: Response, next: NextFunction) => {
     if (response.headersSent) {
       next(error);
       return;
@@ -621,7 +655,9 @@ export function createApp(dependencies: AppDependencies): Express {
       const status = error.code === "LIMIT_FILE_SIZE" ? 413 : 400;
       response.status(status).json({
         error: error.code === "LIMIT_FILE_SIZE"
-          ? "Background music is too large."
+          ? request.path.endsWith("/assets")
+            ? "The uploaded image is too large."
+            : "Background music is too large."
           : "The multipart upload is invalid.",
         code: error.code,
       });
