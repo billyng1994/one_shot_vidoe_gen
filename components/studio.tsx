@@ -5,7 +5,6 @@ import {
   ArrowRight,
   Check,
   Download,
-  ExternalLink,
   Film,
   FolderOpen,
   Image as ImageIcon,
@@ -39,6 +38,10 @@ import { AccountMenu } from "@/components/account-menu";
 import { useAuth } from "@/components/auth-provider";
 import { CompositionEditor } from "@/components/composition-editor";
 import {
+  CompositionTemplateLibrary,
+  type CompositionTemplateAction,
+} from "@/components/composition-template-library";
+import {
   createDefaultLayers,
   createDefaultLogoLayer,
   createTextLayer,
@@ -64,6 +67,11 @@ import type {
   OverlayUploadResponse,
   RenderResponse,
 } from "@/lib/api-types";
+import {
+  parseCompositionTemplateList,
+  parseCompositionTemplateSummary,
+  type CompositionTemplateSummary,
+} from "@/lib/composition-templates";
 import {
   getSquareCropGeometry,
   MAX_CROP_ZOOM,
@@ -237,11 +245,13 @@ function WorkflowNav({
   step,
   imageReady,
   videoReady,
+  disabled = false,
   onStep,
 }: {
   step: Step;
   imageReady: boolean;
   videoReady: boolean;
+  disabled?: boolean;
   onStep: (step: Step) => void;
 }) {
   const items: Array<{ step: Step; eyebrow: string; label: string; enabled: boolean }> = [
@@ -258,7 +268,7 @@ function WorkflowNav({
             className={`workflow-step ${step === item.step ? "is-active" : ""} ${
               step > item.step ? "is-done" : ""
             }`}
-            disabled={!item.enabled}
+            disabled={disabled || !item.enabled}
             onClick={() => onStep(item.step)}
             type="button"
           >
@@ -425,6 +435,10 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
   const [layers, setLayers] = useState<CompositionLayer[]>(createDefaultLayers);
   const [selectedLayerId, setSelectedLayerId] = useState("text-1");
   const [assetUploadBusy, setAssetUploadBusy] = useState(false);
+  const [compositionTemplates, setCompositionTemplates] = useState<CompositionTemplateSummary[]>([]);
+  const [templateAction, setTemplateAction] = useState<CompositionTemplateAction>({ kind: "loading" });
+  const [templateError, setTemplateError] = useState("");
+  const [templateNotice, setTemplateNotice] = useState("");
   const [music, setMusic] = useState<File | null>(null);
   const [musicUrl, setMusicUrl] = useState("");
   const [musicVolume, setMusicVolume] = useState(0.24);
@@ -442,6 +456,7 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
   const requestedProjectIdRef = useRef(initialProjectId);
   const uploadRevisionRef = useRef(0);
   const cropSelectionRevisionRef = useRef(0);
+  const templateOperationRevisionRef = useRef(0);
   const pendingCropUrlRef = useRef("");
   const firstFrameUploadControllerRef = useRef<AbortController | null>(null);
   const firstFrameInputRef = useRef<HTMLInputElement>(null);
@@ -490,12 +505,21 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
         pendingSaveRef.current = null;
         setSaveStatus("saving");
         try {
+          const expectedProjectUpdatedAt = projectsRef.current.find(
+            ({ id }) => id === pending.projectId,
+          )?.updatedAt;
+          if (!expectedProjectUpdatedAt) {
+            throw new Error("The project version is unavailable. Refresh before saving.");
+          }
           const updated = await request<StudioProject>(
             `/api/projects/${encodeURIComponent(pending.projectId)}`,
             {
               method: "PATCH",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ snapshot: pending.snapshot }),
+              body: JSON.stringify({
+                snapshot: pending.snapshot,
+                expectedProjectUpdatedAt,
+              }),
             },
           );
           lastSavedSnapshotRef.current = pending.serialized;
@@ -525,6 +549,30 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
     request<BackendHealth>("/api/health", { cache: "no-store" })
       .then(setHealth)
       .catch(() => setHealth(null));
+  }, [request]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const revision = templateOperationRevisionRef.current + 1;
+    templateOperationRevisionRef.current = revision;
+    request<unknown>("/api/composition-templates", {
+      cache: "no-store",
+      signal: controller.signal,
+    }).then((response) => {
+      if (controller.signal.aborted || templateOperationRevisionRef.current !== revision) return;
+      const parsed = parseCompositionTemplateList(response);
+      if (!parsed) throw new Error("The server returned an invalid template library.");
+      setCompositionTemplates(parsed);
+      setTemplateError("");
+      setTemplateAction(null);
+    }).catch((error) => {
+      if (controller.signal.aborted || templateOperationRevisionRef.current !== revision) return;
+      setTemplateError(
+        error instanceof Error ? error.message : "The template library could not be loaded.",
+      );
+      setTemplateAction(null);
+    });
+    return () => controller.abort();
   }, [request]);
 
   useEffect(() => {
@@ -759,12 +807,12 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
 
   useEffect(() => {
     const warnBeforeUnload = (event: BeforeUnloadEvent) => {
-      if (!pendingSaveRef.current && !saveInFlightRef.current) return;
+      if (!pendingSaveRef.current && !saveInFlightRef.current && !templateAction) return;
       event.preventDefault();
     };
     window.addEventListener("beforeunload", warnBeforeUnload);
     return () => window.removeEventListener("beforeunload", warnBeforeUnload);
-  }, []);
+  }, [templateAction]);
 
   useEffect(() => {
     window.scrollTo({ top: 0, left: 0, behavior: "auto" });
@@ -836,6 +884,188 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
       );
     }
     await runQueuedSave();
+  };
+
+  const saveCompositionTemplate = async (name: string) => {
+    if (templateAction) return false;
+    const workspaceId = activeProjectIdRef.current;
+    if (!workspaceId || hydratedProjectId !== workspaceId) return false;
+    const revision = templateOperationRevisionRef.current + 1;
+    templateOperationRevisionRef.current = revision;
+    setTemplateAction({ kind: "saving" });
+    setTemplateError("");
+    setTemplateNotice("");
+    try {
+      await persistActiveProject();
+      const project = projectsRef.current.find(({ id }) => id === workspaceId);
+      if (!project || activeProjectIdRef.current !== workspaceId) return false;
+      const response = await request<unknown>("/api/composition-templates", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name,
+          sourceProjectId: workspaceId,
+          expectedProjectUpdatedAt: project.updatedAt,
+        }),
+      });
+      const template = parseCompositionTemplateSummary(response);
+      if (!template) throw new Error("The server returned an invalid composition template.");
+      if (
+        templateOperationRevisionRef.current !== revision ||
+        activeProjectIdRef.current !== workspaceId
+      ) return false;
+      setCompositionTemplates((current) => [
+        template,
+        ...current.filter(({ id }) => id !== template.id),
+      ]);
+      setTemplateNotice(`Saved “${template.name}”.`);
+      return true;
+    } catch (error) {
+      if (templateOperationRevisionRef.current === revision) {
+        setTemplateError(error instanceof Error ? error.message : "The template could not be saved.");
+      }
+      return false;
+    } finally {
+      if (templateOperationRevisionRef.current === revision) setTemplateAction(null);
+    }
+  };
+
+  const renameCompositionTemplate = async (
+    template: CompositionTemplateSummary,
+    name: string,
+  ) => {
+    if (templateAction) return false;
+    const revision = templateOperationRevisionRef.current + 1;
+    templateOperationRevisionRef.current = revision;
+    setTemplateAction({ kind: "renaming", templateId: template.id });
+    setTemplateError("");
+    setTemplateNotice("");
+    try {
+      const response = await request<unknown>(
+        `/api/composition-templates/${encodeURIComponent(template.id)}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name,
+            expectedTemplateUpdatedAt: template.updatedAt,
+          }),
+        },
+      );
+      const renamed = parseCompositionTemplateSummary(response);
+      if (!renamed) throw new Error("The server returned an invalid composition template.");
+      if (templateOperationRevisionRef.current !== revision) return false;
+      setCompositionTemplates((current) => current.map((candidate) =>
+        candidate.id === renamed.id ? renamed : candidate,
+      ));
+      setTemplateNotice(`Renamed template to “${renamed.name}”.`);
+      return true;
+    } catch (error) {
+      if (templateOperationRevisionRef.current === revision) {
+        setTemplateError(error instanceof Error ? error.message : "The template could not be renamed.");
+      }
+      return false;
+    } finally {
+      if (templateOperationRevisionRef.current === revision) setTemplateAction(null);
+    }
+  };
+
+  const deleteCompositionTemplate = async (template: CompositionTemplateSummary) => {
+    if (templateAction) return false;
+    const revision = templateOperationRevisionRef.current + 1;
+    templateOperationRevisionRef.current = revision;
+    setTemplateAction({ kind: "deleting", templateId: template.id });
+    setTemplateError("");
+    setTemplateNotice("");
+    try {
+      await request<{ deleted: boolean }>(
+        `/api/composition-templates/${encodeURIComponent(template.id)}`,
+        { method: "DELETE" },
+      );
+      if (templateOperationRevisionRef.current !== revision) return false;
+      setCompositionTemplates((current) => current.filter(({ id }) => id !== template.id));
+      setTemplateNotice(`Deleted “${template.name}”.`);
+      return true;
+    } catch (error) {
+      if (templateOperationRevisionRef.current === revision) {
+        setTemplateError(error instanceof Error ? error.message : "The template could not be deleted.");
+      }
+      return false;
+    } finally {
+      if (templateOperationRevisionRef.current === revision) setTemplateAction(null);
+    }
+  };
+
+  const applyCompositionTemplate = async (template: CompositionTemplateSummary) => {
+    if (templateAction) return false;
+    const workspaceId = activeProjectIdRef.current;
+    if (!workspaceId || hydratedProjectId !== workspaceId) return false;
+    const revision = templateOperationRevisionRef.current + 1;
+    templateOperationRevisionRef.current = revision;
+    setTemplateAction({ kind: "applying", templateId: template.id });
+    setTemplateError("");
+    setTemplateNotice("");
+    try {
+      await persistActiveProject();
+      const currentProject = projectsRef.current.find(({ id }) => id === workspaceId);
+      if (!currentProject || activeProjectIdRef.current !== workspaceId) return false;
+      const response = await request<unknown>(
+        `/api/projects/${encodeURIComponent(workspaceId)}/composition/apply-template`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            templateId: template.id,
+            expectedProjectUpdatedAt: currentProject.updatedAt,
+          }),
+        },
+      );
+      if (!response || typeof response !== "object" || Array.isArray(response)) {
+        throw new Error("The server returned an invalid applied template.");
+      }
+      const body = response as Record<string, unknown>;
+      const appliedTemplate = parseCompositionTemplateSummary(body.template);
+      const project = parseStudioProject(body.project, workspaceId);
+      if (!appliedTemplate || !project) {
+        throw new Error("The server returned an invalid applied template.");
+      }
+      if (
+        templateOperationRevisionRef.current !== revision ||
+        activeProjectIdRef.current !== workspaceId
+      ) return false;
+
+      if (saveTimerRef.current !== undefined) {
+        window.clearTimeout(saveTimerRef.current);
+        saveTimerRef.current = undefined;
+      }
+      pendingSaveRef.current = null;
+      lastSavedSnapshotRef.current = JSON.stringify(project.snapshot);
+      const nextProjects = projectsRef.current.map((candidate) =>
+        candidate.id === workspaceId ? project : candidate,
+      );
+      projectsRef.current = nextProjects;
+      setProjects(nextProjects);
+      setLayers(project.snapshot.layers);
+      setSelectedLayerId(
+        project.snapshot.layers.findLast((layer) => layer.type === "text")?.id
+          ?? project.snapshot.layers.at(-1)?.id
+          ?? "",
+      );
+      setSaveStatus("saved");
+      setRenderJob({ phase: "idle" });
+      setCompositionTemplates((current) => current.map((candidate) =>
+        candidate.id === appliedTemplate.id ? appliedTemplate : candidate,
+      ));
+      setTemplateNotice(`Applied “${appliedTemplate.name}”. You can keep editing any layer.`);
+      return true;
+    } catch (error) {
+      if (templateOperationRevisionRef.current === revision) {
+        setTemplateError(error instanceof Error ? error.message : "The template could not be applied.");
+      }
+      return false;
+    } finally {
+      if (templateOperationRevisionRef.current === revision) setTemplateAction(null);
+    }
   };
 
   const selectProject = async (projectId: string) => {
@@ -1435,6 +1665,7 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
     if (
       renderJob.phase === "in_progress" ||
       assetUploadBusy ||
+      templateAction !== null ||
       projectActionBusy ||
       !activeProjectId ||
       hydratedProjectId !== activeProjectId
@@ -1472,6 +1703,7 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
     if (
       renderJob.phase === "in_progress" ||
       assetUploadBusy ||
+      templateAction !== null ||
       projectActionBusy ||
       !activeProjectId ||
       hydratedProjectId !== activeProjectId
@@ -1498,6 +1730,7 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
       !videoUrl ||
       renderJob.phase === "in_progress" ||
       assetUploadBusy ||
+      templateAction !== null ||
       projectActionBusy ||
       !activeProjectId ||
       hydratedProjectId !== activeProjectId
@@ -1546,6 +1779,7 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
   const compositionEditingDisabled =
     renderBusy ||
     assetUploadBusy ||
+    templateAction !== null ||
     projectActionBusy ||
     !activeProjectId ||
     hydratedProjectId !== activeProjectId;
@@ -1554,6 +1788,7 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
     videoBusy ||
     renderBusy ||
     assetUploadBusy ||
+    templateAction !== null ||
     projectActionBusy ||
     !activeProjectId ||
     hydratedProjectId !== activeProjectId;
@@ -1606,6 +1841,7 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
         </div>
         <WorkflowNav
           step={step}
+          disabled={templateAction !== null}
           imageReady={Boolean(imageUrl) && !cropSource && !imageBusy}
           videoReady={Boolean(videoUrl) && !cropSource && !imageBusy}
           onStep={setStep}
@@ -2098,7 +2334,12 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
         {step === 3 ? (
           <>
             <aside className="control-panel composer-controls">
-              <button className="back-button" onClick={() => setStep(2)} type="button">
+              <button
+                className="back-button"
+                disabled={templateAction !== null}
+                onClick={() => setStep(2)}
+                type="button"
+              >
                 <ArrowLeft size={15} /> Back to motion
               </button>
               <div className="panel-heading compact-heading">
@@ -2106,6 +2347,18 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
                 <h1 className="sr-only">Make it unmistakably yours.</h1>
                 <p>Add text and images, arrange every layer, mix music, and export.</p>
               </div>
+
+              <CompositionTemplateLibrary
+                action={templateAction}
+                disabled={compositionEditingDisabled}
+                error={templateError}
+                notice={templateNotice}
+                onApply={applyCompositionTemplate}
+                onDelete={deleteCompositionTemplate}
+                onRename={renameCompositionTemplate}
+                onSave={saveCompositionTemplate}
+                templates={compositionTemplates}
+              />
 
               <CompositionEditor
                 disabled={compositionEditingDisabled}
@@ -2139,6 +2392,7 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
                 <input
                   accept="audio/*,.mp3,.wav,.m4a,.aac"
                   className="sr-only"
+                  disabled={compositionEditingDisabled}
                   id="music-upload"
                   onChange={(event) => selectMusic(event.target.files?.[0] ?? null)}
                   type="file"
@@ -2158,19 +2412,6 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
                     <output>{Math.round(musicVolume * 100)}%</output>
                   </div>
                 ) : null}
-              </section>
-
-              <section className="template-card">
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img alt="GoStudy frame reference" src="/reference/gostudy-reference.png" />
-                <div>
-                  <span>TEMPLATE</span>
-                  <strong>GoStudy Orange</strong>
-                  <a href="/reference/gostudy-reference.png" rel="noreferrer" target="_blank">
-                    View reference <ExternalLink size={11} />
-                  </a>
-                </div>
-                <Check size={16} />
               </section>
 
               <JobMessage job={renderJob} />

@@ -24,6 +24,9 @@ The API intentionally has no separate user-authentication layer. Keep it on loop
   image is center-cropped/resized to a 1080 × 1080 PNG and returned as a completed image job
 - `POST /api/generations/video` with `{ projectId, prompt, imageRequestId, duration, resolution, cameraFixed }`
 - `GET /api/generations/:requestId`
+- `GET|POST /api/composition-templates` to list or capture the current project layer stack
+- `PATCH|DELETE /api/composition-templates/:templateId` to rename or delete an account template
+- `POST /api/projects/:projectId/composition/apply-template` to copy and apply a saved layer stack
 - `POST /api/render` as multipart form data with `projectId`, `videoUrl`, title placement fields, and optional `music`
 - `DELETE /api/projects/:projectId/media`
 - `GET|HEAD /media/**`, including single byte-range requests

@@ -203,13 +203,33 @@ describe("Express backend API", () => {
       adminAgent.patch(`/api/projects/${projectId}`),
       bootstrapSession.csrfToken,
     )
-      .send({ name: "Persisted project", snapshot: updatedSnapshot })
+      .send({
+        name: "Persisted project",
+        snapshot: updatedSnapshot,
+        expectedProjectUpdatedAt: created.body.updatedAt,
+      })
       .expect(200);
     expect(updated.body).toMatchObject({
       id: projectId,
       name: "Persisted project",
       snapshot: { imagePrompt: "A durable server-side project" },
     });
+    await browserMutation(
+      adminAgent.patch(`/api/projects/${projectId}`),
+      bootstrapSession.csrfToken,
+    )
+      .send({ snapshot: updatedSnapshot })
+      .expect(428, {
+        error: "The current project version is required when saving a snapshot.",
+        code: "PROJECT_VERSION_REQUIRED",
+      });
+    await browserMutation(
+      adminAgent.patch(`/api/projects/${projectId}`),
+      bootstrapSession.csrfToken,
+    )
+      .send({ snapshot: updatedSnapshot, expectedProjectUpdatedAt: created.body.updatedAt })
+      .expect(409)
+      .expect(({ body }) => expect(body).toMatchObject({ code: "PROJECT_CONFLICT" }));
     await adminAgent
       .get("/api/projects")
       .expect(200)
@@ -645,7 +665,7 @@ describe("Express backend API", () => {
       adminAgent.patch(`/api/projects/${projectId}`),
       admin.csrfToken,
     )
-      .send({ snapshot })
+      .send({ snapshot, expectedProjectUpdatedAt: project.body.updatedAt })
       .expect(200)
       .expect(({ body }) => expect(body.snapshot.layers.at(-1)).toMatchObject({
         id: "image-uploaded",
@@ -663,5 +683,123 @@ describe("Express backend API", () => {
       })
       .expect(400)
       .expect(({ body }) => expect(body).toMatchObject({ code: "INVALID_IMAGE_UPLOAD" }));
+  });
+
+  it("saves portable composition templates and applies project-owned image copies", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "backend-template-api-test-"));
+    temporaryDirectories.push(dataDir);
+    const runtime = createBackendRuntime(config(dataDir));
+    await runtime.initialize();
+    const adminAgent = request.agent(runtime.app);
+    const admin = await bootstrap(adminAgent);
+    const source = await createProject(adminAgent, admin.csrfToken, "Template source");
+    const target = await createProject(adminAgent, admin.csrfToken, "Template target");
+    const sourceProjectId = source.body.id as string;
+    const targetProjectId = target.body.id as string;
+    const jpeg = await sharp({
+      create: { width: 120, height: 80, channels: 3, background: "#396dc8" },
+    }).jpeg().toBuffer();
+    const uploaded = await browserMutation(
+      adminAgent.post(`/api/projects/${sourceProjectId}/assets`),
+      admin.csrfToken,
+    )
+      .attach("image", jpeg, { filename: "portrait.jpg", contentType: "image/jpeg" })
+      .expect(201);
+    const sourceSnapshot = {
+      ...source.body.snapshot,
+      layers: [
+        ...source.body.snapshot.layers,
+        {
+          id: "portable-portrait",
+          type: "image",
+          role: "overlay",
+          name: "Portable portrait",
+          src: uploaded.body.url,
+          x: 0.2,
+          y: 0.3,
+          width: 0.3,
+          aspectRatio: 1.5,
+          mask: "circle",
+        },
+      ],
+    };
+    const savedSource = await browserMutation(
+      adminAgent.patch(`/api/projects/${sourceProjectId}`),
+      admin.csrfToken,
+    ).send({
+      snapshot: sourceSnapshot,
+      expectedProjectUpdatedAt: source.body.updatedAt,
+    }).expect(200);
+
+    await request(runtime.app)
+      .get("/api/composition-templates")
+      .expect(401, { error: "Authentication is required.", code: "AUTH_REQUIRED" });
+    await adminAgent
+      .post("/api/composition-templates")
+      .set("X-OneTake-Request", "1")
+      .send({ name: "Portable frame", sourceProjectId })
+      .expect(403, { error: "The request could not be verified.", code: "CSRF_INVALID" });
+
+    const captured = await browserMutation(
+      adminAgent.post("/api/composition-templates"),
+      admin.csrfToken,
+    ).send({
+      name: "Portable frame",
+      sourceProjectId,
+      expectedProjectUpdatedAt: savedSource.body.updatedAt,
+    }).expect(201);
+    expect(captured.body).toMatchObject({
+      version: 1,
+      name: "Portable frame",
+      layerCount: 3,
+      textLayerCount: 1,
+      imageLayerCount: 2,
+    });
+    await adminAgent
+      .get("/api/composition-templates")
+      .expect(200)
+      .expect(({ body }) => expect(body.templates).toEqual([captured.body]));
+
+    await browserMutation(
+      adminAgent.delete(`/api/projects/${sourceProjectId}`),
+      admin.csrfToken,
+    ).expect(200);
+
+    const applied = await browserMutation(
+      adminAgent.post(`/api/projects/${targetProjectId}/composition/apply-template`),
+      admin.csrfToken,
+    ).send({
+      templateId: captured.body.id,
+      expectedProjectUpdatedAt: target.body.updatedAt,
+    }).expect(200);
+    expect(applied.body.project).toMatchObject({
+      id: targetProjectId,
+      name: "Template target",
+      snapshot: {
+        imagePrompt: target.body.snapshot.imagePrompt,
+        motionPrompt: target.body.snapshot.motionPrompt,
+        layers: [
+          { id: "brand-logo", src: "/gostudy-logo.svg" },
+          { id: "text-1" },
+          {
+            id: "portable-portrait",
+            src: expect.stringMatching(
+              new RegExp(`^/media/${targetProjectId}/images/overlay-[0-9a-f-]+\\.png$`),
+            ),
+          },
+        ],
+      },
+    });
+    const copiedUrl = applied.body.project.snapshot.layers[2].src as string;
+    await adminAgent.get(copiedUrl).expect(200);
+
+    await browserMutation(
+      adminAgent.delete(`/api/composition-templates/${captured.body.id as string}`),
+      admin.csrfToken,
+    ).expect(200, { deleted: true });
+    await adminAgent.get(copiedUrl).expect(200);
+    await adminAgent
+      .get("/api/composition-templates")
+      .expect(200, { templates: [] });
   });
 });

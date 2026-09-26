@@ -26,6 +26,7 @@ import {
   type SessionGrant,
 } from "./auth.js";
 import type { BackendConfig } from "./config.js";
+import { CompositionTemplateService } from "./composition-template-service.js";
 import { BackendError, publicBackendError } from "./errors.js";
 import { GenerationService, type ProviderAdapter } from "./generation-service.js";
 import { HiggsfieldError, publicError as publicHiggsfieldError } from "./higgsfield.js";
@@ -46,6 +47,7 @@ type AppDependencies = {
   projects: ProjectService;
   providerManagement: ProviderManagementService;
   renders: RenderService;
+  templates: CompositionTemplateService;
 };
 
 type LoginAttempt = {
@@ -232,6 +234,7 @@ export function createApp(dependencies: AppDependencies): Express {
     projects,
     providerManagement,
     renders,
+    templates,
   } = dependencies;
   const app = express();
   const cookieConfig: SessionCookieConfig = {
@@ -420,14 +423,138 @@ export function createApp(dependencies: AppDependencies): Express {
       const ownerId = requireAuthenticatedSession(response).user.id;
       const { projectId } = request.params;
       assertProjectId(projectId);
+      const hasSnapshot = Object.prototype.hasOwnProperty.call(body, "snapshot");
+      if (hasSnapshot && typeof body.expectedProjectUpdatedAt !== "string") {
+        throw new BackendError(
+          "The current project version is required when saving a snapshot.",
+          428,
+          "PROJECT_VERSION_REQUIRED",
+        );
+      }
       response.json(await projects.update(ownerId, projectId, {
         ...(Object.prototype.hasOwnProperty.call(body, "name")
           ? { name: body.name as string }
           : {}),
-        ...(Object.prototype.hasOwnProperty.call(body, "snapshot")
-          ? { snapshot: body.snapshot as never }
+        ...(hasSnapshot
+          ? {
+              snapshot: body.snapshot as never,
+              expectedUpdatedAt: body.expectedProjectUpdatedAt,
+            }
           : {}),
       }));
+    }),
+  );
+
+  app.get(
+    "/api/composition-templates",
+    requireAuthentication,
+    asyncRoute(async (_request, response) => {
+      const ownerId = requireAuthenticatedSession(response).user.id;
+      response.set("Cache-Control", "private, no-store");
+      response.json({ templates: await templates.list(ownerId) });
+    }),
+  );
+
+  app.post(
+    "/api/composition-templates",
+    requireAuthentication,
+    csrf,
+    asyncRoute(async (request, response) => {
+      const body = requestBody(request);
+      const ownerId = requireAuthenticatedSession(response).user.id;
+      assertProjectId(body.sourceProjectId);
+      const sourceProject = await projects.get(ownerId, body.sourceProjectId);
+      if (
+        Object.prototype.hasOwnProperty.call(body, "expectedProjectUpdatedAt") &&
+        body.expectedProjectUpdatedAt !== sourceProject.updatedAt
+      ) {
+        throw new BackendError(
+          "This project changed in another session. Refresh it before saving a template.",
+          409,
+          "PROJECT_CONFLICT",
+        );
+      }
+      response.status(201).json(await templates.capture({
+        ownerId,
+        sourceProjectId: sourceProject.id,
+        name: body.name,
+        layers: sourceProject.snapshot.layers,
+      }));
+    }),
+  );
+
+  app.patch(
+    "/api/composition-templates/:templateId",
+    requireAuthentication,
+    csrf,
+    asyncRoute(async (request, response) => {
+      const body = requestBody(request);
+      const ownerId = requireAuthenticatedSession(response).user.id;
+      const { templateId } = request.params;
+      if (typeof templateId !== "string") {
+        throw new BackendError("Invalid composition template ID.", 400, "INVALID_TEMPLATE_ID");
+      }
+      if (typeof body.expectedTemplateUpdatedAt !== "string") {
+        throw new BackendError(
+          "The current template version is required when renaming.",
+          428,
+          "TEMPLATE_VERSION_REQUIRED",
+        );
+      }
+      response.json(await templates.rename(
+        ownerId,
+        templateId,
+        body.name,
+        body.expectedTemplateUpdatedAt,
+      ));
+    }),
+  );
+
+  app.delete(
+    "/api/composition-templates/:templateId",
+    requireAuthentication,
+    csrf,
+    asyncRoute(async (request, response) => {
+      const ownerId = requireAuthenticatedSession(response).user.id;
+      const { templateId } = request.params;
+      if (typeof templateId !== "string") {
+        throw new BackendError("Invalid composition template ID.", 400, "INVALID_TEMPLATE_ID");
+      }
+      await templates.delete(ownerId, templateId);
+      response.json({ deleted: true });
+    }),
+  );
+
+  app.post(
+    "/api/projects/:projectId/composition/apply-template",
+    requireAuthentication,
+    csrf,
+    asyncRoute(async (request, response) => {
+      const body = requestBody(request);
+      const ownerId = requireAuthenticatedSession(response).user.id;
+      const { projectId } = request.params;
+      assertProjectId(projectId);
+      if (typeof body.expectedProjectUpdatedAt !== "string") {
+        throw new BackendError(
+          "The current project version is required when applying a template.",
+          428,
+          "PROJECT_VERSION_REQUIRED",
+        );
+      }
+      await projects.get(ownerId, projectId);
+      const application = await templates.materialize(ownerId, body.templateId as string, projectId);
+      try {
+        const project = await projects.updateLayers(
+          ownerId,
+          projectId,
+          application.layers,
+          body.expectedProjectUpdatedAt,
+        );
+        response.json({ template: application.template, project });
+      } catch (error) {
+        await templates.discardMaterialized(application);
+        throw error;
+      }
     }),
   );
 
@@ -740,6 +867,7 @@ export type BackendRuntime = {
   projects: ProjectService;
   providerManagement: ProviderManagementService;
   renders: RenderService;
+  templates: CompositionTemplateService;
   initialize(): Promise<void>;
 };
 
@@ -757,6 +885,7 @@ export function createBackendRuntime(
     { image: config.maxImageBytes, video: config.maxVideoBytes },
   );
   const projects = new ProjectService(config.dataDir);
+  const templates = new CompositionTemplateService(config.dataDir, media);
   const generations = new GenerationService(
     jobs,
     media,
@@ -787,6 +916,7 @@ export function createBackendRuntime(
       projects,
       providerManagement,
       renders,
+      templates,
     }),
     auth,
     generations,
@@ -795,8 +925,14 @@ export function createBackendRuntime(
     projects,
     providerManagement,
     renders,
+    templates,
     async initialize() {
-      await Promise.all([auth.initialize(), projects.initialize(), generations.initialize()]);
+      await Promise.all([
+        auth.initialize(),
+        projects.initialize(),
+        templates.initialize(),
+        generations.initialize(),
+      ]);
     },
   };
 }

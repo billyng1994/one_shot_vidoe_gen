@@ -6,6 +6,10 @@ OneTake is a three-stage social-video workflow:
 2. Use that image job as frame one for Seedance 2.0.
 3. Compose layered text, logos, overlay images, and optional music, then render an H.264 MP4.
 
+Step 3 compositions can be saved as account-level frame templates. Templates preserve text,
+images, styling, positions, sizes, masks, and layer order; applying one replaces only the target
+project's editable layer stack, leaving its generated video and music settings unchanged.
+
 ## Architecture and storage
 
 The application runs as two processes:
@@ -41,6 +45,11 @@ backend/data/                         # default for a local backend
   projects/
     <user-id>/
       <project-id>.json               # name and complete editor snapshot
+  composition-templates/
+    <user-id>/
+      <template-id>/
+        template.json                 # versioned layer stack with private asset references
+        assets/*.png                  # independent copies of custom logos/overlays
   jobs/
     gen-image-<uuid>.json
     gen-video-<uuid>.json
@@ -56,6 +65,9 @@ atomic rename. Passwords use salted scrypt hashes, and raw session tokens are ne
 to disk. The browser receives only `/media/...` URLs; provider URLs and backend disk paths
 are not exposed. Project, job, and media access is checked against the signed-in owner.
 Deleting a project removes its project record, media, and job records.
+Saved templates remain usable after their source project is deleted. Applying a template copies
+its private image assets into the target project, so deleting the template later does not alter
+projects that already use it.
 
 Back up the entire data directory as one unit and restrict it to the backend service account.
 It contains password hashes and active session hashes in addition to generated media.

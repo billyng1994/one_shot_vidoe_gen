@@ -2152,6 +2152,276 @@ input[type="range"] {
   color: var(--green);
 }
 
+.composition-template-library {
+  display: grid;
+  gap: 10px;
+}
+
+.template-library-heading {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.template-library-heading .section-title {
+  margin-bottom: 0;
+}
+
+.template-save-trigger,
+.template-apply-button,
+.template-name-form button,
+.template-rename-form button,
+.template-list-actions > button {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+  justify-content: center;
+  color: #615c55;
+  border: 1px solid #d9d4cc;
+  border-radius: 8px;
+  background: #fff;
+  font-size: 9px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.template-save-trigger {
+  min-height: 30px;
+  padding: 0 9px;
+}
+
+.template-save-trigger:hover:not(:disabled),
+.template-list-actions > button:hover:not(:disabled),
+.template-name-form button:hover:not(:disabled),
+.template-rename-form button:hover:not(:disabled) {
+  color: var(--orange-dark);
+  border-color: rgba(255, 84, 35, 0.45);
+  background: #fff8f4;
+}
+
+.template-save-trigger:disabled,
+.template-name-form button:disabled,
+.template-rename-form button:disabled,
+.template-list-actions > button:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+
+.template-library-help {
+  margin: 0;
+  color: #8a857d;
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.template-name-form {
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid #ead8ce;
+  border-radius: 11px;
+  background: #fff8f4;
+}
+
+.template-name-form > label {
+  color: #67615a;
+  font-size: 9px;
+  font-weight: 800;
+}
+
+.template-name-form > div,
+.template-rename-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 30px auto;
+  gap: 5px;
+}
+
+.template-name-form input,
+.template-rename-form input {
+  min-width: 0;
+  height: 32px;
+  padding: 0 9px;
+  color: var(--ink);
+  border: 1px solid #d7d1c9;
+  border-radius: 8px;
+  outline: 0;
+  background: #fff;
+  font: inherit;
+  font-size: 10px;
+}
+
+.template-name-form input:focus,
+.template-rename-form input:focus {
+  border-color: var(--orange);
+  box-shadow: 0 0 0 2px rgba(255, 84, 35, 0.11);
+}
+
+.template-name-form button {
+  min-height: 32px;
+  padding: 0 9px;
+}
+
+.template-name-form button[aria-label] {
+  padding: 0;
+}
+
+.template-library-state,
+.template-library-empty {
+  display: flex;
+  min-height: 54px;
+  gap: 9px;
+  align-items: center;
+  padding: 10px;
+  color: #8b857d;
+  border: 1px dashed #d8d2ca;
+  border-radius: 11px;
+  background: #faf8f5;
+  font-size: 9px;
+}
+
+.template-library-empty > svg {
+  flex: 0 0 auto;
+  color: #aaa39a;
+}
+
+.template-library-empty span {
+  display: grid;
+  gap: 2px;
+}
+
+.template-library-empty strong {
+  color: #5f5a53;
+  font-size: 9px;
+}
+
+.template-library-empty small {
+  color: #99938b;
+  font-size: 8px;
+}
+
+.template-list {
+  display: grid;
+  overflow-y: auto;
+  max-height: 194px;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.template-list > li {
+  display: grid;
+  min-height: 48px;
+  grid-template-columns: 32px minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 7px;
+  border: 1px solid #e1ddd6;
+  border-radius: 10px;
+  background: #faf9f6;
+}
+
+.template-list > li.is-busy {
+  border-color: rgba(255, 84, 35, 0.42);
+  background: #fff8f4;
+}
+
+.template-list-icon {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  color: var(--orange-dark);
+  border-radius: 9px;
+  background: #ffe9e2;
+  place-items: center;
+}
+
+.template-list-copy {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.template-list-copy strong,
+.template-list-copy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.template-list-copy strong {
+  color: #393631;
+  font-size: 9px;
+}
+
+.template-list-copy small {
+  color: #98928a;
+  font-size: 8px;
+}
+
+.template-list-actions {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+
+.template-list-actions > button {
+  min-width: 29px;
+  min-height: 29px;
+  padding: 0 7px;
+}
+
+.template-list-actions > button[aria-label] {
+  padding: 0;
+}
+
+.template-list-actions .template-apply-button {
+  color: #fff;
+  border-color: var(--ink);
+  background: var(--ink);
+}
+
+.template-list-actions .template-apply-button:hover:not(:disabled) {
+  color: #fff;
+  border-color: #302e2a;
+  background: #302e2a;
+}
+
+.template-list-actions .template-delete-button:hover:not(:disabled) {
+  color: var(--error);
+  border-color: rgba(182, 61, 42, 0.35);
+  background: #fff2ef;
+}
+
+.template-rename-form {
+  grid-column: 1 / -1;
+}
+
+.template-rename-form button {
+  min-height: 32px;
+  padding: 0;
+}
+
+.template-library-feedback {
+  min-height: 0;
+}
+
+.template-library-feedback p {
+  margin: 0;
+  padding: 7px 8px;
+  color: var(--error);
+  border-radius: 8px;
+  background: #fff0ed;
+  font-size: 9px;
+  line-height: 1.4;
+}
+
+.template-library-feedback p.is-success {
+  color: #356c54;
+  background: #edf8f1;
+}
+
 .export-button {
   width: 100%;
   margin-top: auto;
@@ -2578,9 +2848,18 @@ input[type="range"] {
 
 @media (max-width: 820px), (pointer: coarse) {
   .icon-button,
-  .layer-order-actions button {
+  .layer-order-actions button,
+  .template-list-actions > button,
+  .template-save-trigger,
+  .template-name-form button,
+  .template-rename-form button {
     width: 44px;
     min-height: 44px;
+  }
+
+  .template-save-trigger,
+  .template-list-actions .template-apply-button {
+    width: auto;
   }
 }
 

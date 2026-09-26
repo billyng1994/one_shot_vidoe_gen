@@ -16,6 +16,7 @@ import {
   type StudioProject,
   type StudioSnapshot,
 } from "./project-schema.js";
+import type { CompositionLayer } from "./composition.js";
 
 type ProjectEnvelope = {
   storageVersion: 1;
@@ -33,6 +34,7 @@ export type CreateProjectInput = {
 export type UpdateProjectInput = {
   name?: string;
   snapshot?: StudioSnapshot;
+  expectedUpdatedAt?: unknown;
 };
 
 export type LocalProjectImportResult = {
@@ -118,6 +120,13 @@ export class ProjectStore {
       throw new BackendError("The project clock returned an invalid timestamp.", 500, "INVALID_CLOCK");
     }
     return timestamp;
+  }
+
+  private nextTimestamp(previous: string) {
+    const candidate = this.now();
+    return Date.parse(candidate) > Date.parse(previous)
+      ? candidate
+      : new Date(Date.parse(previous) + 1).toISOString();
   }
 
   private async serialize<T>(ownerId: string, operation: () => Promise<T>) {
@@ -294,12 +303,51 @@ export class ProjectStore {
       const hasName = Object.prototype.hasOwnProperty.call(input, "name");
       const hasSnapshot = Object.prototype.hasOwnProperty.call(input, "snapshot");
       if (!hasName && !hasSnapshot) return current;
+      if (
+        hasSnapshot &&
+        input.expectedUpdatedAt !== undefined &&
+        input.expectedUpdatedAt !== current.updatedAt
+      ) {
+        throw new BackendError(
+          "This project changed in another session. Refresh it before saving.",
+          409,
+          "PROJECT_CONFLICT",
+        );
+      }
 
       const updated: StudioProject = {
         ...current,
         name: hasName ? normalizeProjectName(input.name, current.name) : current.name,
         snapshot: hasSnapshot ? validateStudioSnapshot(input.snapshot, projectId) : current.snapshot,
-        updatedAt: this.now(),
+        updatedAt: this.nextTimestamp(current.updatedAt),
+      };
+      return this.atomicWrite(ownerId, updated);
+    });
+  }
+
+  async updateLayers(
+    ownerId: string,
+    projectId: string,
+    layers: CompositionLayer[],
+    expectedUpdatedAt?: unknown,
+  ) {
+    validateProjectId(projectId);
+    return this.serialize(ownerId, async () => {
+      const current = await this.read(ownerId, projectId);
+      if (!current) {
+        throw new BackendError("Project not found.", 404, "PROJECT_NOT_FOUND");
+      }
+      if (expectedUpdatedAt !== undefined && expectedUpdatedAt !== current.updatedAt) {
+        throw new BackendError(
+          "This project changed in another session. Refresh it before applying the template.",
+          409,
+          "PROJECT_CONFLICT",
+        );
+      }
+      const updated: StudioProject = {
+        ...current,
+        snapshot: validateStudioSnapshot({ ...current.snapshot, layers }, projectId),
+        updatedAt: this.nextTimestamp(current.updatedAt),
       };
       return this.atomicWrite(ownerId, updated);
     });
