@@ -4,6 +4,7 @@ import { createReadStream } from "node:fs";
 import {
   mkdir,
   open,
+  readdir,
   realpath,
   rename,
   rm,
@@ -19,6 +20,7 @@ import { BackendError } from "./errors.js";
 import type { StoredMedia } from "./job-store.js";
 import {
   assertProjectId,
+  assertSafeFilename,
   mediaRelativePath,
   mediaUrl,
   parseBackendRequestId,
@@ -34,6 +36,16 @@ const MAX_REDIRECTS = 4;
 const DOWNLOAD_TIMEOUT_MS = 90_000;
 const MAX_UPLOADED_IMAGE_PIXELS = 40_000_000;
 const UPLOAD_IMAGE_FORMATS = new Set(["avif", "jpeg", "png", "webp"]);
+const FIRST_FRAME_SIZE = 1080;
+const FIRST_FRAME_STAGING_DIRECTORY = ".first-frame-staging";
+const UPLOADED_FIRST_FRAME_SUFFIX = ".uploaded.png";
+
+export type StagedFirstFrame = {
+  output: StoredMedia;
+  path: string;
+  width: number;
+  height: number;
+};
 
 const MIME_BY_EXTENSION: Record<string, string> = {
   ".avif": "image/avif",
@@ -369,16 +381,135 @@ export class MediaStorage {
 
   async storeUploadedImage(input: { projectId: string; bytes: Buffer }) {
     assertProjectId(input.projectId);
-    if (input.bytes.byteLength === 0) {
+    const normalized = await this.normalizeUploadedImage(input.bytes);
+    const filename = `overlay-${randomUUID()}.png`;
+    const stored = await this.storeNormalizedImage(input.projectId, filename, normalized.data);
+
+    return {
+      url: mediaUrl(stored.relativePath),
+      width: normalized.info.width,
+      height: normalized.info.height,
+    };
+  }
+
+  async stageUploadedFirstFrame(input: {
+    projectId: string;
+    bytes: Buffer;
+    requestId: string;
+  }) {
+    assertProjectId(input.projectId);
+    const request = parseBackendRequestId(input.requestId);
+    if (request.kind !== "image") {
+      throw new BackendError("The first-frame request must be an image.", 500, "JOB_KIND_MISMATCH");
+    }
+    const normalized = await this.normalizeUploadedImage(input.bytes, FIRST_FRAME_SIZE);
+    await this.initialize();
+    const stagingDirectory = join(this.mediaDirectory, FIRST_FRAME_STAGING_DIRECTORY);
+    await mkdir(stagingDirectory, { recursive: true, mode: 0o700 });
+    const root = await realpath(this.mediaDirectory);
+    const resolvedStagingDirectory = await realpath(stagingDirectory);
+    if (resolvedStagingDirectory !== join(root, FIRST_FRAME_STAGING_DIRECTORY)) {
+      throw new BackendError("The upload staging directory is unsafe.", 500, "UNSAFE_MEDIA_DIRECTORY");
+    }
+    const filename = `${input.requestId}.${randomUUID()}.png`;
+    const path = join(resolvedStagingDirectory, filename);
+    await writeFile(path, normalized.data, { flag: "wx", mode: 0o600 });
+    const output = {
+      bytes: normalized.data.byteLength,
+      contentType: "image/png",
+      relativePath: mediaRelativePath(
+        input.projectId,
+        "images",
+        `${input.requestId}${UPLOADED_FIRST_FRAME_SUFFIX}`,
+      ),
+    } satisfies StoredMedia;
+
+    return {
+      output,
+      path,
+      width: normalized.info.width,
+      height: normalized.info.height,
+    } satisfies StagedFirstFrame;
+  }
+
+  async commitUploadedFirstFrame(staged: StagedFirstFrame) {
+    const parsed = parseMediaRelativePath(staged.output.relativePath);
+    const requestId = parsed.filename.slice(0, -UPLOADED_FIRST_FRAME_SUFFIX.length);
+    const request = parseBackendRequestId(requestId);
+    if (
+      request.kind !== "image" ||
+      parsed.category !== "images" ||
+      parsed.filename !== `${request.requestId}${UPLOADED_FIRST_FRAME_SUFFIX}`
+    ) {
+      throw new BackendError("The staged first frame is invalid.", 500, "INVALID_MEDIA_PATH");
+    }
+
+    const stagingDirectory = await realpath(
+      join(this.mediaDirectory, FIRST_FRAME_STAGING_DIRECTORY),
+    );
+    const stagedPath = await realpath(staged.path);
+    if (!stagedPath.startsWith(`${stagingDirectory}${sep}`)) {
+      throw new BackendError("The staged first frame is unsafe.", 500, "UNSAFE_MEDIA_DIRECTORY");
+    }
+    const directory = await this.categoryDirectory(parsed.projectId, "image");
+    await rename(stagedPath, join(directory, parsed.filename));
+    return staged.output;
+  }
+
+  async discardUploadedFirstFrame(staged: StagedFirstFrame) {
+    await Promise.allSettled([
+      rm(staged.path, { force: true }),
+      this.deleteFile(staged.output.relativePath),
+    ]);
+  }
+
+  async reconcileUploadedFirstFrames(referencedPaths: Iterable<string>) {
+    await this.initialize();
+    const referenced = new Set(referencedPaths);
+    const stagingDirectory = join(this.mediaDirectory, FIRST_FRAME_STAGING_DIRECTORY);
+    await rm(stagingDirectory, { recursive: true, force: true });
+    await mkdir(stagingDirectory, { recursive: true, mode: 0o700 });
+
+    const projects = await readdir(this.mediaDirectory, { withFileTypes: true });
+    for (const project of projects) {
+      if (!project.isDirectory()) continue;
+      try {
+        assertProjectId(project.name);
+      } catch {
+        continue;
+      }
+      const imagesDirectory = join(this.mediaDirectory, project.name, "images");
+      const images = await readdir(imagesDirectory, { withFileTypes: true }).catch((error) => {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+        throw error;
+      });
+      for (const image of images) {
+        if (!image.isFile() || !image.name.endsWith(UPLOADED_FIRST_FRAME_SUFFIX)) continue;
+        const requestId = image.name.slice(0, -UPLOADED_FIRST_FRAME_SUFFIX.length);
+        try {
+          if (parseBackendRequestId(requestId).kind !== "image") continue;
+        } catch {
+          continue;
+        }
+        const relativePath = mediaRelativePath(project.name, "images", image.name);
+        if (!referenced.has(relativePath)) {
+          await rm(join(imagesDirectory, image.name), { force: true });
+        }
+      }
+    }
+  }
+
+  private async normalizeUploadedImage(bytes: Buffer, squareSize?: number) {
+    if (bytes.byteLength === 0) {
       throw new BackendError("Choose an image to upload.", 400, "EMPTY_IMAGE_UPLOAD");
     }
-    if (input.bytes.byteLength > this.limits.image) {
+    if (bytes.byteLength > this.limits.image) {
       throw new BackendError("The uploaded image is too large.", 413, "IMAGE_TOO_LARGE");
     }
 
     let normalized: { data: Buffer; info: { width: number; height: number } };
     try {
-      const source = sharp(input.bytes, {
+      const source = sharp(bytes, {
         animated: false,
         failOn: "error",
         limitInputPixels: MAX_UPLOADED_IMAGE_PIXELS,
@@ -397,8 +528,11 @@ export class MediaStorage {
           "INVALID_IMAGE_UPLOAD",
         );
       }
-      normalized = await source
-        .rotate()
+      const oriented = source.rotate();
+      const resized = squareSize
+        ? oriented.resize({ width: squareSize, height: squareSize, fit: "cover", position: "centre" })
+        : oriented;
+      normalized = await resized
         .png({ adaptiveFiltering: true, compressionLevel: 9 })
         .toBuffer({ resolveWithObject: true });
     } catch (error) {
@@ -416,24 +550,35 @@ export class MediaStorage {
         "IMAGE_TOO_LARGE",
       );
     }
+    return normalized;
+  }
 
-    const directory = await this.categoryDirectory(input.projectId, "image");
-    const filename = `overlay-${randomUUID()}.png`;
-    const relativePath = mediaRelativePath(input.projectId, "images", filename);
+  private async storeNormalizedImage(projectId: string, filename: string, data: Buffer) {
+    assertProjectId(projectId);
+    assertSafeFilename(filename);
+    const directory = await this.categoryDirectory(projectId, "image");
+    const relativePath = mediaRelativePath(projectId, "images", filename);
     const destination = join(directory, filename);
     const temporary = join(directory, `.${filename}.${randomUUID()}.tmp`);
     try {
-      await writeFile(temporary, normalized.data, { flag: "wx", mode: 0o600 });
+      await writeFile(temporary, data, { flag: "wx", mode: 0o600 });
       await rename(temporary, destination);
     } finally {
       await rm(temporary, { force: true }).catch(() => undefined);
     }
-
     return {
-      url: mediaUrl(relativePath),
-      width: normalized.info.width,
-      height: normalized.info.height,
-    };
+      bytes: data.byteLength,
+      contentType: "image/png",
+      relativePath,
+    } satisfies StoredMedia;
+  }
+
+  async deleteFile(relativePath: string) {
+    const file = await this.resolveFile(relativePath).catch((error) => {
+      if (error instanceof BackendError && error.status === 404) return undefined;
+      throw error;
+    });
+    if (file) await rm(file.path, { force: true });
   }
 
   async resolveFile(relativePath: string) {

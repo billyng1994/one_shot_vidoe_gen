@@ -1,5 +1,5 @@
 import type { lookup as dnsLookup } from "node:dns/promises";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -96,6 +96,86 @@ describe("provider media localization", () => {
     const stored = await storage.resolveFile(uploaded.url.slice("/media/".length));
     const metadata = await sharp(stored.path).metadata();
     expect(metadata).toMatchObject({ format: "png", width: 6, height: 4 });
+  });
+
+  it("stages and atomically commits an uploaded first frame as a 1080px square", async () => {
+    const dataDirectory = await mkdtemp(join(tmpdir(), "backend-media-test-"));
+    temporaryDirectories.push(dataDirectory);
+    const storage = new MediaStorage(
+      dataDirectory,
+      resolve(import.meta.dirname, "..", "assets"),
+      { image: 5 * 1024 * 1024, video: 5 * 1024 * 1024 },
+      vi.fn<typeof fetch>(),
+    );
+    const jpeg = await sharp({
+      create: { width: 1_600, height: 900, channels: 3, background: "#396dc8" },
+    }).jpeg().toBuffer();
+
+    const uploaded = await storage.stageUploadedFirstFrame({
+      projectId: PROJECT_ID,
+      requestId: REQUEST_ID,
+      bytes: jpeg,
+    });
+
+    expect(uploaded.output).toMatchObject({
+      contentType: "image/png",
+      relativePath: `${PROJECT_ID}/images/${REQUEST_ID}.uploaded.png`,
+    });
+    expect(uploaded).toMatchObject({ width: 1080, height: 1080 });
+    await expect(sharp(uploaded.path).metadata()).resolves.toMatchObject({
+      format: "png",
+      width: 1080,
+      height: 1080,
+    });
+    await expect(storage.resolveFile(uploaded.output.relativePath)).rejects.toMatchObject({
+      status: 404,
+      code: "MEDIA_NOT_FOUND",
+    });
+
+    await storage.commitUploadedFirstFrame(uploaded);
+
+    await expect(sharp((await storage.resolveFile(uploaded.output.relativePath)).path).metadata())
+      .resolves.toMatchObject({ format: "png", width: 1080, height: 1080 });
+  });
+
+  it("reconciles interrupted and unreferenced first-frame uploads after a restart", async () => {
+    const dataDirectory = await mkdtemp(join(tmpdir(), "backend-media-test-"));
+    temporaryDirectories.push(dataDirectory);
+    const storage = new MediaStorage(
+      dataDirectory,
+      resolve(import.meta.dirname, "..", "assets"),
+      { image: 5 * 1024 * 1024, video: 5 * 1024 * 1024 },
+      vi.fn<typeof fetch>(),
+    );
+    const png = await sharp({
+      create: { width: 20, height: 20, channels: 3, background: "#396dc8" },
+    }).png().toBuffer();
+    const referenced = await storage.stageUploadedFirstFrame({
+      projectId: PROJECT_ID,
+      requestId: REQUEST_ID,
+      bytes: png,
+    });
+    await storage.commitUploadedFirstFrame(referenced);
+    const orphaned = await storage.stageUploadedFirstFrame({
+      projectId: PROJECT_ID,
+      requestId: "gen-image-33333333-3333-4333-8333-333333333333",
+      bytes: png,
+    });
+    await storage.commitUploadedFirstFrame(orphaned);
+    const interrupted = await storage.stageUploadedFirstFrame({
+      projectId: PROJECT_ID,
+      requestId: "gen-image-44444444-4444-4444-8444-444444444444",
+      bytes: png,
+    });
+
+    await storage.reconcileUploadedFirstFrames([referenced.output.relativePath]);
+
+    await expect(storage.resolveFile(referenced.output.relativePath)).resolves.toBeDefined();
+    await expect(storage.resolveFile(orphaned.output.relativePath)).rejects.toMatchObject({
+      status: 404,
+      code: "MEDIA_NOT_FOUND",
+    });
+    await expect(stat(interrupted.path)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("rejects undecodable and vector uploads", async () => {

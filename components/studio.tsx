@@ -64,6 +64,11 @@ import type {
   OverlayUploadResponse,
   RenderResponse,
 } from "@/lib/api-types";
+import {
+  getSquareCropGeometry,
+  MAX_CROP_ZOOM,
+  MIN_CROP_ZOOM,
+} from "@/lib/image-crop";
 import { mediaDownloadFilename } from "@/lib/media-download";
 import {
   type PersistedAsset,
@@ -72,8 +77,25 @@ import {
 import { parseStudioProject, type StudioProject } from "@/lib/studio-projects";
 
 type Step = 1 | 2 | 3;
+type FirstFrameMethod = "generate" | "upload";
 type JobPhase = "idle" | "submitting" | GenerationStatus | "error";
 type JobState = { phase: JobPhase; message?: string };
+type CropSource = {
+  file: File;
+  height: number;
+  url: string;
+  width: number;
+};
+
+const FIRST_FRAME_SIZE = 1_080;
+const FIRST_FRAME_BACKGROUND = "#24211e";
+const MAX_FIRST_FRAME_BYTES = 30 * 1024 * 1024;
+const FIRST_FRAME_TYPES = new Set([
+  "image/avif",
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+]);
 const IMAGE_IDEAS = [
   "A warm documentary portrait in soft morning light",
   "A joyful family reunion, cinematic natural light",
@@ -87,6 +109,61 @@ const MOTION_IDEAS = [
 ];
 
 type ApiRequest = <T>(url: string, init?: RequestInit) => Promise<T>;
+
+function loadBrowserImage(url: string) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const image = new Image();
+    image.decoding = "async";
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("This image could not be opened."));
+    image.src = url;
+  });
+}
+
+function megabytes(bytes: number) {
+  return `${Math.max(0.1, bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+async function croppedFirstFrame(
+  source: CropSource,
+  zoom: number,
+  position: { x: number; y: number },
+) {
+  const image = await loadBrowserImage(source.url);
+  const crop = getSquareCropGeometry({
+    sourceWidth: image.naturalWidth,
+    sourceHeight: image.naturalHeight,
+    zoom,
+    positionX: position.x,
+    positionY: position.y,
+  });
+  const canvas = document.createElement("canvas");
+  canvas.width = FIRST_FRAME_SIZE;
+  canvas.height = FIRST_FRAME_SIZE;
+  const context = canvas.getContext("2d");
+  if (!context) throw new Error("Your browser could not prepare this crop.");
+  context.imageSmoothingEnabled = true;
+  context.imageSmoothingQuality = "high";
+  context.fillStyle = FIRST_FRAME_BACKGROUND;
+  context.fillRect(0, 0, FIRST_FRAME_SIZE, FIRST_FRAME_SIZE);
+  context.drawImage(
+    image,
+    crop.source.x,
+    crop.source.y,
+    crop.source.size,
+    crop.source.size,
+    0,
+    0,
+    FIRST_FRAME_SIZE,
+    FIRST_FRAME_SIZE,
+  );
+
+  const blob = await new Promise<Blob | null>((resolve) => {
+    canvas.toBlob(resolve, "image/png");
+  });
+  if (!blob) throw new Error("Your browser could not export this crop.");
+  return blob;
+}
 
 function sleep(milliseconds: number, signal?: AbortSignal) {
   return new Promise<void>((resolve, reject) => {
@@ -282,7 +359,7 @@ function JobMessage({ job }: { job: JobState }) {
   return (
     <div className={`job-message ${isError ? "is-error" : ""}`} role="status">
       <StatusDot phase={job.phase} />
-      <span>{labels[job.phase]}</span>
+      <span>{job.message ?? labels[job.phase]}</span>
     </div>
   );
 }
@@ -296,7 +373,7 @@ function CredentialNotice({ health }: { health: BackendHealth | null }) {
       ? "Run `higgsfield auth login` on the backend host, then restart the backend."
       : "Install the Higgsfield CLI on the backend, authenticate it, then restart the service.";
   const title = health.storage.writable
-    ? "Connect Higgsfield to generate"
+    ? "Connect Higgsfield"
     : "Backend storage is unavailable";
 
   return (
@@ -330,10 +407,14 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
   const { request } = useAuth();
   const [step, setStep] = useState<Step>(1);
   const [health, setHealth] = useState<BackendHealth | null>(null);
+  const [firstFrameMethod, setFirstFrameMethod] = useState<FirstFrameMethod>("generate");
   const [imagePrompt, setImagePrompt] = useState("");
   const [motionPrompt, setMotionPrompt] = useState("");
   const [imageUrl, setImageUrl] = useState("");
   const [imageRequestId, setImageRequestId] = useState("");
+  const [cropSource, setCropSource] = useState<CropSource | null>(null);
+  const [cropZoom, setCropZoom] = useState(MIN_CROP_ZOOM);
+  const [cropPosition, setCropPosition] = useState({ x: 0.5, y: 0.5 });
   const [videoUrl, setVideoUrl] = useState("");
   const [videoRequestId, setVideoRequestId] = useState("");
   const [duration, setDuration] = useState<5 | 8 | 10>(5);
@@ -360,6 +441,19 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
   const activeProjectIdRef = useRef("");
   const requestedProjectIdRef = useRef(initialProjectId);
   const uploadRevisionRef = useRef(0);
+  const cropSelectionRevisionRef = useRef(0);
+  const pendingCropUrlRef = useRef("");
+  const firstFrameUploadControllerRef = useRef<AbortController | null>(null);
+  const firstFrameInputRef = useRef<HTMLInputElement>(null);
+  const cropDragRef = useRef<{
+    pointerId: number;
+    startClientX: number;
+    startClientY: number;
+    startX: number;
+    startY: number;
+    overflowX: number;
+    overflowY: number;
+  } | null>(null);
   const lastSavedSnapshotRef = useRef("");
   const saveRevisionRef = useRef(0);
   const saveTimerRef = useRef<number | undefined>(undefined);
@@ -438,11 +532,22 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
     let active = true;
     requestedProjectIdRef.current = initialProjectId;
     uploadRevisionRef.current += 1;
+    cropSelectionRevisionRef.current += 1;
+    firstFrameUploadControllerRef.current?.abort();
+    firstFrameUploadControllerRef.current = null;
+    if (pendingCropUrlRef.current) {
+      URL.revokeObjectURL(pendingCropUrlRef.current);
+      pendingCropUrlRef.current = "";
+    }
     activeProjectIdRef.current = "";
     queueMicrotask(() => {
       if (!active) return;
       setActiveProjectId("");
       setHydratedProjectId("");
+      setFirstFrameMethod("generate");
+      setCropSource(null);
+      setCropZoom(MIN_CROP_ZOOM);
+      setCropPosition({ x: 0.5, y: 0.5 });
       setProjectMissing(false);
       setProjectLoadError("");
     });
@@ -549,11 +654,16 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
     queueMicrotask(() => {
       if (!active || activeProjectIdRef.current !== workspaceId) return;
 
+      cropSelectionRevisionRef.current += 1;
       setStep(snapshot.step);
+      setFirstFrameMethod("generate");
       setImagePrompt(snapshot.imagePrompt);
       setMotionPrompt(snapshot.motionPrompt);
       setImageUrl(snapshot.image.url);
       setImageRequestId(snapshot.image.requestId);
+      setCropSource(null);
+      setCropZoom(MIN_CROP_ZOOM);
+      setCropPosition({ x: 0.5, y: 0.5 });
       setVideoUrl(snapshot.video.url);
       setVideoRequestId(snapshot.video.requestId);
       setDuration(snapshot.duration);
@@ -665,6 +775,25 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
       if (musicUrl.startsWith("blob:")) URL.revokeObjectURL(musicUrl);
     };
   }, [musicUrl]);
+
+  useEffect(() => {
+    return () => {
+      if (cropSource?.url.startsWith("blob:")) URL.revokeObjectURL(cropSource.url);
+    };
+  }, [cropSource]);
+
+  useEffect(() => {
+    return () => {
+      cropSelectionRevisionRef.current += 1;
+      uploadRevisionRef.current += 1;
+      firstFrameUploadControllerRef.current?.abort();
+      firstFrameUploadControllerRef.current = null;
+      if (pendingCropUrlRef.current) {
+        URL.revokeObjectURL(pendingCropUrlRef.current);
+        pendingCropUrlRef.current = "";
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (audioRef.current) audioRef.current.volume = musicVolume;
@@ -830,12 +959,194 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
     }
   };
 
+  const chooseFirstFrameMethod = (method: FirstFrameMethod) => {
+    if (imageBusy || method === firstFrameMethod) return;
+    setFirstFrameMethod(method);
+    setImageJob({ phase: imageUrl ? "completed" : "idle" });
+    if (method === "generate") {
+      cropSelectionRevisionRef.current += 1;
+      setCropSource(null);
+      setCropZoom(MIN_CROP_ZOOM);
+      setCropPosition({ x: 0.5, y: 0.5 });
+    }
+  };
+
+  const selectFirstFrameFile = async (file: File | null) => {
+    if (!file) return;
+    if (!FIRST_FRAME_TYPES.has(file.type.toLowerCase())) {
+      setImageJob({
+        phase: "error",
+        message: "Choose a PNG, JPEG, WebP, or AVIF image.",
+      });
+      return;
+    }
+    if (file.size > MAX_FIRST_FRAME_BYTES) {
+      setImageJob({
+        phase: "error",
+        message: "Choose an image smaller than 30 MB.",
+      });
+      return;
+    }
+
+    const revision = cropSelectionRevisionRef.current + 1;
+    cropSelectionRevisionRef.current = revision;
+    setCropSource(null);
+    setImageJob({ phase: "submitting", message: "Opening your image…" });
+    if (pendingCropUrlRef.current) URL.revokeObjectURL(pendingCropUrlRef.current);
+    const url = URL.createObjectURL(file);
+    pendingCropUrlRef.current = url;
+    try {
+      const image = await loadBrowserImage(url);
+      if (cropSelectionRevisionRef.current !== revision) {
+        if (pendingCropUrlRef.current === url) pendingCropUrlRef.current = "";
+        URL.revokeObjectURL(url);
+        return;
+      }
+      if (!image.naturalWidth || !image.naturalHeight) {
+        throw new Error("This image has invalid dimensions.");
+      }
+      setCropSource({
+        file,
+        height: image.naturalHeight,
+        url,
+        width: image.naturalWidth,
+      });
+      if (pendingCropUrlRef.current === url) pendingCropUrlRef.current = "";
+      setCropZoom(MIN_CROP_ZOOM);
+      setCropPosition({ x: 0.5, y: 0.5 });
+      setImageJob({ phase: "completed", message: "Image ready to crop" });
+    } catch (error) {
+      if (pendingCropUrlRef.current === url) pendingCropUrlRef.current = "";
+      URL.revokeObjectURL(url);
+      if (cropSelectionRevisionRef.current !== revision) return;
+      setImageJob({
+        phase: "error",
+        message: error instanceof Error ? error.message : "This image could not be opened.",
+      });
+    }
+  };
+
+  const discardCrop = () => {
+    cropSelectionRevisionRef.current += 1;
+    setCropSource(null);
+    setCropZoom(MIN_CROP_ZOOM);
+    setCropPosition({ x: 0.5, y: 0.5 });
+    setImageJob({ phase: imageUrl ? "completed" : "idle" });
+  };
+
+  const uploadCroppedFirstFrame = async () => {
+    if (!cropSource || imageBusy || firstFrameUploadControllerRef.current) return;
+    const source = cropSource;
+    const cropRevision = cropSelectionRevisionRef.current;
+    const workspaceId = activeProjectIdRef.current;
+    if (!workspaceId || requestedProjectIdRef.current !== workspaceId) {
+      setImageJob({ phase: "error", message: "Open a project before uploading an image." });
+      return;
+    }
+    const uploadRevision = uploadRevisionRef.current + 1;
+    uploadRevisionRef.current = uploadRevision;
+    const controller = new AbortController();
+    firstFrameUploadControllerRef.current = controller;
+    setImageJob({ phase: "submitting", message: "Preparing and uploading your crop…" });
+
+    try {
+      const blob = await croppedFirstFrame(source, cropZoom, cropPosition);
+      const baseName = source.file.name.replace(/\.[^.]+$/, "").trim().slice(0, 80)
+        || "first-frame";
+      const form = new FormData();
+      form.append("image", new File([blob], `${baseName}.png`, { type: "image/png" }));
+      const result = await request<GenerationRequest>(
+        `/api/projects/${encodeURIComponent(workspaceId)}/first-frame`,
+        { method: "POST", body: form, signal: controller.signal },
+      );
+      const url = result.images?.[0]?.url;
+      if (result.status !== "completed" || !result.request_id || !url) {
+        throw new Error("The backend did not return a usable first frame.");
+      }
+      if (
+        uploadRevisionRef.current !== uploadRevision ||
+        cropSelectionRevisionRef.current !== cropRevision ||
+        activeProjectIdRef.current !== workspaceId ||
+        requestedProjectIdRef.current !== workspaceId
+      ) return;
+
+      cropSelectionRevisionRef.current += 1;
+      setStep(1);
+      setImageUrl(url);
+      setImageRequestId(result.request_id);
+      setVideoUrl("");
+      setVideoRequestId("");
+      setVideoJob({ phase: "idle" });
+      setImageJob({ phase: "completed", message: "Cropped first frame ready" });
+      setCropSource(null);
+    } catch (error) {
+      if (
+        uploadRevisionRef.current !== uploadRevision ||
+        cropSelectionRevisionRef.current !== cropRevision ||
+        activeProjectIdRef.current !== workspaceId
+      ) return;
+      setImageJob({
+        phase: "error",
+        message: error instanceof Error ? error.message : "Image upload failed.",
+      });
+    } finally {
+      if (firstFrameUploadControllerRef.current === controller) {
+        firstFrameUploadControllerRef.current = null;
+      }
+    }
+  };
+
+  const startCropDrag = (event: PointerEvent<HTMLDivElement>) => {
+    if (!cropSource || imageBusy || event.button !== 0) return;
+    const crop = getSquareCropGeometry({
+      sourceWidth: cropSource.width,
+      sourceHeight: cropSource.height,
+      zoom: cropZoom,
+      positionX: cropPosition.x,
+      positionY: cropPosition.y,
+    });
+    const rect = event.currentTarget.getBoundingClientRect();
+    cropDragRef.current = {
+      pointerId: event.pointerId,
+      startClientX: event.clientX,
+      startClientY: event.clientY,
+      startX: cropPosition.x,
+      startY: cropPosition.y,
+      overflowX: rect.width * Math.max(0, crop.preview.widthPercent / 100 - 1),
+      overflowY: rect.height * Math.max(0, crop.preview.heightPercent / 100 - 1),
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    event.preventDefault();
+  };
+
+  const moveCrop = (event: PointerEvent<HTMLDivElement>) => {
+    const drag = cropDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    const deltaX = event.clientX - drag.startClientX;
+    const deltaY = event.clientY - drag.startClientY;
+    setCropPosition({
+      x: drag.overflowX > 0
+        ? clampNumber(drag.startX - deltaX / drag.overflowX, 0, 1)
+        : 0.5,
+      y: drag.overflowY > 0
+        ? clampNumber(drag.startY - deltaY / drag.overflowY, 0, 1)
+        : 0.5,
+    });
+    event.preventDefault();
+  };
+
+  const endCropDrag = (event: PointerEvent<HTMLDivElement>) => {
+    if (cropDragRef.current?.pointerId === event.pointerId) cropDragRef.current = null;
+  };
+
   const generateImage = async () => {
     if (imagePrompt.trim().length < 3) {
       setImageJob({ phase: "error", message: "Describe the image you want first." });
       return;
     }
 
+    cropSelectionRevisionRef.current += 1;
+    setCropSource(null);
     setImageUrl("");
     setImageRequestId("");
     setVideoUrl("");
@@ -912,6 +1223,9 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
   };
 
   const loadSample = () => {
+    cropSelectionRevisionRef.current += 1;
+    setCropSource(null);
+    setFirstFrameMethod("generate");
     setImagePrompt("A hopeful traveler at sunset, warm editorial photography");
     setMotionPrompt("A gentle cinematic push-in with a natural breeze");
     setImageUrl("/media/samples/demo-image.svg");
@@ -1217,6 +1531,15 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
     }
   };
 
+  const cropGeometry = cropSource
+    ? getSquareCropGeometry({
+        sourceWidth: cropSource.width,
+        sourceHeight: cropSource.height,
+        zoom: cropZoom,
+        positionX: cropPosition.x,
+        positionY: cropPosition.y,
+      })
+    : null;
   const imageBusy = ["submitting", "queued", "in_progress"].includes(imageJob.phase);
   const videoBusy = ["submitting", "queued", "in_progress"].includes(videoJob.phase);
   const renderBusy = renderJob.phase === "in_progress";
@@ -1283,8 +1606,8 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
         </div>
         <WorkflowNav
           step={step}
-          imageReady={Boolean(imageUrl)}
-          videoReady={Boolean(videoUrl)}
+          imageReady={Boolean(imageUrl) && !cropSource && !imageBusy}
+          videoReady={Boolean(videoUrl) && !cropSource && !imageBusy}
           onStep={setStep}
         />
         <div className="header-end">
@@ -1330,63 +1653,199 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
             <aside className="control-panel">
               <div className="panel-heading">
                 <span className="eyebrow">01 · FIRST FRAME</span>
-                <h1 className="sr-only">Turn an idea into an image.</h1>
+                <h1 className="sr-only">Choose your first frame.</h1>
                 <p>
-                  {health?.models.image ?? "GPT Image 2"} creates the square source
-                  frame that anchors your video.
+                  Generate a new image with {health?.models.image ?? "GPT Image 2"}, or
+                  upload your own and choose the square crop.
                 </p>
               </div>
 
               <CredentialNotice health={health} />
 
-              <label className="field-label" htmlFor="image-prompt">
-                Image prompt
-                <span>{imagePrompt.length}/4,000</span>
-              </label>
-              <div className="prompt-field">
-                <textarea
-                  id="image-prompt"
-                  maxLength={4_000}
-                  onChange={(event) => setImagePrompt(event.target.value)}
-                  placeholder="Describe the subject, setting, light, mood, and camera style…"
-                  rows={7}
-                  value={imagePrompt}
-                />
-                <Sparkles aria-hidden="true" className="prompt-sparkle" size={17} />
+              <div className="first-frame-methods" role="group" aria-label="First frame source">
+                <button
+                  aria-pressed={firstFrameMethod === "generate"}
+                  className={firstFrameMethod === "generate" ? "is-active" : ""}
+                  disabled={workspaceBusy}
+                  onClick={() => chooseFirstFrameMethod("generate")}
+                  type="button"
+                >
+                  <Sparkles aria-hidden="true" size={15} /> Generate
+                </button>
+                <button
+                  aria-pressed={firstFrameMethod === "upload"}
+                  className={firstFrameMethod === "upload" ? "is-active" : ""}
+                  disabled={workspaceBusy}
+                  onClick={() => chooseFirstFrameMethod("upload")}
+                  type="button"
+                >
+                  <Upload aria-hidden="true" size={15} /> Upload
+                </button>
               </div>
 
-              <div className="idea-list" aria-label="Image prompt ideas">
-                {IMAGE_IDEAS.map((idea) => (
-                  <button key={idea} onClick={() => setImagePrompt(idea)} type="button">
-                    {idea}
+              {firstFrameMethod === "generate" ? (
+                <>
+                  <label className="field-label" htmlFor="image-prompt">
+                    Image prompt
+                    <span>{imagePrompt.length}/4,000</span>
+                  </label>
+                  <div className="prompt-field">
+                    <textarea
+                      id="image-prompt"
+                      maxLength={4_000}
+                      onChange={(event) => setImagePrompt(event.target.value)}
+                      placeholder="Describe the subject, setting, light, mood, and camera style…"
+                      rows={7}
+                      value={imagePrompt}
+                    />
+                    <Sparkles aria-hidden="true" className="prompt-sparkle" size={17} />
+                  </div>
+
+                  <div className="idea-list" aria-label="Image prompt ideas">
+                    {IMAGE_IDEAS.map((idea) => (
+                      <button key={idea} onClick={() => setImagePrompt(idea)} type="button">
+                        {idea}
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="setting-grid">
+                    <div className="setting-card">
+                      <span>Model</span>
+                      <strong>{health?.models.image ?? "GPT Image 2"}</strong>
+                    </div>
+                    <div className="setting-card">
+                      <span>Format</span>
+                      <strong>1:1 · PNG</strong>
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <div className="first-frame-upload-controls">
+                  <input
+                    accept="image/png,image/jpeg,image/webp,image/avif"
+                    disabled={workspaceBusy}
+                    hidden
+                    id="first-frame-upload"
+                    onChange={(event) => {
+                      const file = event.currentTarget.files?.[0] ?? null;
+                      event.currentTarget.value = "";
+                      void selectFirstFrameFile(file);
+                    }}
+                    ref={firstFrameInputRef}
+                    type="file"
+                  />
+                  <button
+                    className={`first-frame-picker ${cropSource ? "has-file" : ""}`}
+                    disabled={workspaceBusy}
+                    onClick={() => firstFrameInputRef.current?.click()}
+                    type="button"
+                  >
+                    <span className="first-frame-picker-icon">
+                      <Upload aria-hidden="true" size={20} />
+                    </span>
+                    <span className="first-frame-picker-copy">
+                      <strong>{cropSource ? cropSource.file.name : "Choose an image"}</strong>
+                      <span>
+                        {cropSource
+                          ? `${cropSource.width} × ${cropSource.height} · ${megabytes(cropSource.file.size)}`
+                          : "PNG, JPEG, WebP or AVIF · up to 30 MB"}
+                      </span>
+                    </span>
+                    {cropSource ? <span className="first-frame-picker-change">Change</span> : null}
                   </button>
-                ))}
-              </div>
 
-              <div className="setting-grid">
-                <div className="setting-card">
-                  <span>Model</span>
-                  <strong>{health?.models.image ?? "GPT Image 2"}</strong>
+                  {cropSource && cropGeometry ? (
+                    <div className="crop-controls">
+                      <div className="crop-controls-heading">
+                        <span><Move aria-hidden="true" size={14} /> Crop controls</span>
+                        <button disabled={imageBusy} onClick={discardCrop} type="button">Cancel</button>
+                      </div>
+                      <label className="crop-control" htmlFor="crop-zoom">
+                        <span>Zoom <output>{cropZoom.toFixed(2)}×</output></span>
+                        <input
+                          disabled={imageBusy}
+                          id="crop-zoom"
+                          max={MAX_CROP_ZOOM}
+                          min={MIN_CROP_ZOOM}
+                          onChange={(event) => setCropZoom(Number(event.target.value))}
+                          step="0.01"
+                          type="range"
+                          value={cropZoom}
+                        />
+                      </label>
+                      <label className="crop-control" htmlFor="crop-horizontal">
+                        <span>Horizontal <output>{Math.round(cropPosition.x * 100)}%</output></span>
+                        <input
+                          disabled={imageBusy || cropGeometry.preview.widthPercent <= 100}
+                          id="crop-horizontal"
+                          max="1"
+                          min="0"
+                          onChange={(event) => setCropPosition((current) => ({
+                            ...current,
+                            x: Number(event.target.value),
+                          }))}
+                          step="0.01"
+                          type="range"
+                          value={cropPosition.x}
+                        />
+                      </label>
+                      <label className="crop-control" htmlFor="crop-vertical">
+                        <span>Vertical <output>{Math.round(cropPosition.y * 100)}%</output></span>
+                        <input
+                          disabled={imageBusy || cropGeometry.preview.heightPercent <= 100}
+                          id="crop-vertical"
+                          max="1"
+                          min="0"
+                          onChange={(event) => setCropPosition((current) => ({
+                            ...current,
+                            y: Number(event.target.value),
+                          }))}
+                          step="0.01"
+                          type="range"
+                          value={cropPosition.y}
+                        />
+                      </label>
+                      <p>Drag the preview or use these controls to frame the shot.</p>
+                    </div>
+                  ) : null}
                 </div>
-                <div className="setting-card">
-                  <span>Format</span>
-                  <strong>1:1 · PNG</strong>
-                </div>
-              </div>
+              )}
 
               <JobMessage job={imageJob} />
 
               <div className="panel-actions">
-                <button
-                  className="primary-button"
-                  disabled={imageBusy}
-                  onClick={generateImage}
-                  type="button"
-                >
-                  {imageBusy ? <LoaderCircle className="spin" size={18} /> : <Sparkles size={18} />}
-                  {imageUrl ? "Generate another" : "Generate first frame"}
-                </button>
-                {imageUrl ? (
+                {firstFrameMethod === "generate" ? (
+                  <button
+                    className="primary-button"
+                    disabled={workspaceBusy}
+                    onClick={generateImage}
+                    type="button"
+                  >
+                    {imageBusy ? <LoaderCircle className="spin" size={18} /> : <Sparkles size={18} />}
+                    {imageUrl ? "Generate another" : "Generate first frame"}
+                  </button>
+                ) : cropSource ? (
+                  <button
+                    className="primary-button"
+                    disabled={workspaceBusy}
+                    onClick={uploadCroppedFirstFrame}
+                    type="button"
+                  >
+                    {imageBusy ? <LoaderCircle className="spin" size={18} /> : <Upload size={18} />}
+                    {imageBusy ? "Uploading crop…" : "Use cropped frame"}
+                  </button>
+                ) : !imageUrl ? (
+                  <button
+                    className="primary-button"
+                    disabled={workspaceBusy}
+                    onClick={() => firstFrameInputRef.current?.click()}
+                    type="button"
+                  >
+                    <Upload aria-hidden="true" size={18} /> Choose an image
+                  </button>
+                ) : null}
+                {imageUrl && !cropSource && !imageBusy ? (
                   <>
                     <a
                       className="secondary-button"
@@ -1402,7 +1861,7 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
                 ) : null}
               </div>
 
-              {!health?.configured && !health?.mockMode ? (
+              {firstFrameMethod === "generate" && !health?.configured && !health?.mockMode ? (
                 <button className="sample-link" onClick={loadSample} type="button">
                   Or open a sample project <ArrowRight size={15} />
                 </button>
@@ -1412,23 +1871,55 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
             <section className="preview-panel">
               <div className="preview-toolbar">
                 <div>
-                  <span className="toolbar-kicker">CANVAS</span>
-                  <strong>Square first frame</strong>
+                  <span className="toolbar-kicker">{cropSource ? "CROP PREVIEW" : "CANVAS"}</span>
+                  <strong>{cropSource ? "Choose your square crop" : "Square first frame"}</strong>
                 </div>
                 <span className="dimension-pill">1080 × 1080</span>
               </div>
-              <div className="image-stage">
-                {imageUrl ? (
+              <div
+                className={`image-stage ${cropSource ? "crop-stage" : ""}`}
+                onPointerCancel={endCropDrag}
+                onPointerDown={startCropDrag}
+                onPointerMove={moveCrop}
+                onPointerUp={endCropDrag}
+              >
+                {cropSource && cropGeometry ? (
+                  <>
+                    {/* User-selected object URLs require a native image element for canvas parity. */}
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      alt={`Crop preview for ${cropSource.file.name}`}
+                      className="crop-source-image"
+                      draggable={false}
+                      src={cropSource.url}
+                      style={{
+                        height: `${cropGeometry.preview.heightPercent}%`,
+                        left: `${cropGeometry.preview.leftPercent}%`,
+                        top: `${cropGeometry.preview.topPercent}%`,
+                        width: `${cropGeometry.preview.widthPercent}%`,
+                      }}
+                    />
+                    <span aria-hidden="true" className="crop-grid" />
+                    <span className="crop-drag-hint">
+                      <Move aria-hidden="true" size={14} /> Drag to reposition
+                    </span>
+                  </>
+                ) : imageUrl ? (
                   // Backend media URLs are dynamic, so a native image element is intentional here.
                   // eslint-disable-next-line @next/next/no-img-element
-                  <img alt="Generated first frame" src={imageUrl} />
+                  <img alt="First frame" src={imageUrl} />
                 ) : imageBusy ? (
                   <div className="generating-artwork">
                     <div className="generation-rings"><span /><span /><span /></div>
-                    <strong>Creating your first frame</strong>
+                    <strong>
+                      {firstFrameMethod === "upload"
+                        ? "Opening your image"
+                        : "Creating your first frame"}
+                    </strong>
                     <p>
-                      {health?.models.image ?? "GPT Image 2"} is translating your
-                      direction into a finished still.
+                      {firstFrameMethod === "upload"
+                        ? "Preparing a high-quality crop preview."
+                        : `${health?.models.image ?? "GPT Image 2"} is translating your direction into a finished still.`}
                     </p>
                   </div>
                 ) : (
@@ -1436,7 +1927,11 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
                 )}
               </div>
               <div className="preview-footnote">
-                <LockKeyhole size={14} /> This image is only sent to Seedance after you approve it.
+                {cropSource ? (
+                  <><Move size={14} /> The visible square is the exact frame that will be used.</>
+                ) : (
+                  <><LockKeyhole size={14} /> This image is only sent to Seedance after you approve it.</>
+                )}
               </div>
             </section>
           </>

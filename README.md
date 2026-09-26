@@ -2,7 +2,7 @@
 
 OneTake is a three-stage social-video workflow:
 
-1. Generate a square first frame with Higgsfield CLI and GPT Image 2.
+1. Generate a square first frame with Higgsfield CLI and GPT Image 2, or upload and crop your own.
 2. Use that image job as frame one for Seedance 2.0.
 3. Compose layered text, logos, overlay images, and optional music, then render an H.264 MP4.
 

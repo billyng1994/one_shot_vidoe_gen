@@ -108,6 +108,21 @@ function asyncRoute(
   };
 }
 
+function requestDisconnectSignal(request: Request, response: Response) {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  request.once("aborted", abort);
+  response.once("close", abort);
+  if (request.aborted || response.destroyed) abort();
+  return {
+    signal: controller.signal,
+    dispose() {
+      request.removeListener("aborted", abort);
+      response.removeListener("close", abort);
+    },
+  };
+}
+
 function requestBody(request: Request) {
   if (!request.body || typeof request.body !== "object" || Array.isArray(request.body)) {
     throw new BackendError("A JSON object is required.", 400, "INVALID_JSON_BODY");
@@ -496,6 +511,38 @@ export function createApp(dependencies: AppDependencies): Express {
     },
   });
   app.post(
+    "/api/projects/:projectId/first-frame",
+    requireAuthentication,
+    csrf,
+    asyncRoute(async (request, response, next) => {
+      const { projectId } = request.params;
+      assertProjectId(projectId);
+      await projects.get(requireAuthenticatedSession(response).user.id, projectId);
+      next();
+    }),
+    imageUpload.single("image"),
+    asyncRoute(async (request, response) => {
+      const { projectId } = request.params;
+      assertProjectId(projectId);
+      if (!request.file) {
+        throw new BackendError("Choose an image to upload.", 400, "IMAGE_REQUIRED");
+      }
+      const disconnect = requestDisconnectSignal(request, response);
+      try {
+        const uploaded = await generations.createUploadedImage(
+          projectId,
+          request.file.buffer,
+          disconnect.signal,
+        );
+        if (!disconnect.signal.aborted) response.status(201).json(uploaded);
+      } catch (error) {
+        if (!disconnect.signal.aborted) throw error;
+      } finally {
+        disconnect.dispose();
+      }
+    }),
+  );
+  app.post(
     "/api/projects/:projectId/assets",
     requireAuthentication,
     csrf,
@@ -655,7 +702,7 @@ export function createApp(dependencies: AppDependencies): Express {
       const status = error.code === "LIMIT_FILE_SIZE" ? 413 : 400;
       response.status(status).json({
         error: error.code === "LIMIT_FILE_SIZE"
-          ? request.path.endsWith("/assets")
+          ? request.path.endsWith("/assets") || request.path.endsWith("/first-frame")
             ? "The uploaded image is too large."
             : "Background music is too large."
           : "The multipart upload is invalid.",

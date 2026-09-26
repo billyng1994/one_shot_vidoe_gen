@@ -11,6 +11,7 @@ import {
   getVideoModel,
   submitHiggsfieldImage,
   submitHiggsfieldVideo,
+  uploadHiggsfieldImage,
   type GenerationRequest as ProviderGeneration,
   type VideoGenerationInput,
 } from "./higgsfield.js";
@@ -44,6 +45,7 @@ export type ProviderAdapter = {
   imageModel(): string;
   submitImage(prompt: string, signal?: AbortSignal): Promise<ProviderGeneration>;
   submitVideo(input: VideoGenerationInput, signal?: AbortSignal): Promise<ProviderGeneration>;
+  uploadImage(filePath: string, signal?: AbortSignal): Promise<string>;
   videoModel(): string;
 };
 
@@ -55,6 +57,7 @@ const defaultProvider: ProviderAdapter = {
   imageModel: () => getImageModel(),
   submitImage: (prompt, signal) => submitHiggsfieldImage(prompt, { signal }),
   submitVideo: (input, signal) => submitHiggsfieldVideo(input, { signal }),
+  uploadImage: (filePath, signal) => uploadHiggsfieldImage(filePath, { signal }),
   videoModel: () => getVideoModel(),
 };
 
@@ -103,6 +106,8 @@ export class GenerationService {
   private readonly workers = new Map<string, Promise<void>>();
   private readonly workerControllers = new Map<string, AbortController>();
   private readonly submissions = new Map<string, Promise<unknown>>();
+  private readonly projectMutations = new Map<string, Promise<unknown>>();
+  private readonly uploadControllers = new Map<string, AbortController>();
   private readonly deletingProjects = new Map<string, Promise<number>>();
   private readonly projectEpochs = new Map<string, number>();
 
@@ -119,7 +124,11 @@ export class GenerationService {
 
   async initialize() {
     await Promise.all([this.jobs.initialize(), this.media.initialize()]);
-    await this.resumePendingJobs();
+    const jobs = await this.jobs.list();
+    await this.media.reconcileUploadedFirstFrames(
+      jobs.flatMap((job) => job.output ? [job.output.relativePath] : []),
+    );
+    await this.resumePendingJobs(jobs);
   }
 
   async health() {
@@ -151,6 +160,33 @@ export class GenerationService {
     return operation.finally(() => {
       if (this.submissions.get(key) === operation) this.submissions.delete(key);
     });
+  }
+
+  private serializeProjectMutation<T>(projectId: string, task: () => Promise<T>) {
+    const previous = this.projectMutations.get(projectId) ?? Promise.resolve();
+    const operation = previous.catch(() => undefined).then(task);
+    this.projectMutations.set(projectId, operation);
+    return operation.finally(() => {
+      if (this.projectMutations.get(projectId) === operation) {
+        this.projectMutations.delete(projectId);
+      }
+    });
+  }
+
+  private assertUploadedImageActive(
+    projectId: string,
+    projectEpoch: number,
+    requestSignal?: AbortSignal,
+  ) {
+    if (
+      this.deletingProjects.has(projectId) ||
+      (this.projectEpochs.get(projectId) ?? 0) !== projectEpoch
+    ) {
+      throw new BackendError("Project media was deleted during upload.", 409, "PROJECT_DELETED");
+    }
+    if (requestSignal?.aborted) {
+      throw new BackendError("The first-frame upload was canceled.", 408, "UPLOAD_CANCELED");
+    }
   }
 
   private buildJob(input: {
@@ -217,6 +253,87 @@ export class GenerationService {
     });
   }
 
+  async createUploadedImage(projectId: string, bytes: Buffer, requestSignal?: AbortSignal) {
+    assertProjectId(projectId);
+    if (requestSignal?.aborted) {
+      throw new BackendError("The first-frame upload was canceled.", 408, "UPLOAD_CANCELED");
+    }
+    if (this.deletingProjects.has(projectId)) {
+      throw new BackendError("Project media is being deleted.", 409, "PROJECT_DELETE_IN_PROGRESS");
+    }
+    return this.serializeProjectMutation(projectId, async () => {
+      if (requestSignal?.aborted) {
+        throw new BackendError("The first-frame upload was canceled.", 408, "UPLOAD_CANCELED");
+      }
+      if (this.deletingProjects.has(projectId)) {
+        throw new BackendError("Project media is being deleted.", 409, "PROJECT_DELETE_IN_PROGRESS");
+      }
+      const projectEpoch = this.projectEpochs.get(projectId) ?? 0;
+      const requestId = createBackendRequestId("image");
+      const controller = new AbortController();
+      const signal = requestSignal
+        ? AbortSignal.any([controller.signal, requestSignal])
+        : controller.signal;
+      this.uploadControllers.set(projectId, controller);
+      let staged: Awaited<ReturnType<MediaStorage["stageUploadedFirstFrame"]>> | undefined;
+      let jobCreated = false;
+      let committed = false;
+
+      try {
+        const prepared = await this.media.stageUploadedFirstFrame({ projectId, bytes, requestId });
+        staged = prepared;
+        this.assertUploadedImageActive(projectId, projectEpoch, requestSignal);
+        let providerRequestId: string;
+        try {
+          providerRequestId = this.options.mockMode
+            ? `cli-image-${randomUUID()}`
+            : await this.cli.use(() => this.provider.uploadImage(prepared.path, signal));
+        } catch (error) {
+          this.assertUploadedImageActive(projectId, projectEpoch, requestSignal);
+          throw error;
+        }
+        this.assertUploadedImageActive(projectId, projectEpoch, requestSignal);
+        const providerRequest = parseProviderRequestId(providerRequestId);
+        if (providerRequest.kind !== "image") {
+          throw new BackendError(
+            "The provider returned the wrong upload kind.",
+            502,
+            "PROVIDER_KIND_MISMATCH",
+          );
+        }
+
+        await this.media.commitUploadedFirstFrame(prepared);
+        this.assertUploadedImageActive(projectId, projectEpoch, requestSignal);
+        const now = new Date().toISOString();
+        const job = await this.jobs.create({
+          version: 1,
+          requestId,
+          providerRequestId: providerRequest.requestId,
+          providerImageKind: "upload",
+          projectId,
+          kind: "image",
+          prompt: "Uploaded first frame",
+          status: "completed",
+          createdAt: now,
+          updatedAt: now,
+          output: prepared.output,
+        });
+        jobCreated = true;
+        this.assertUploadedImageActive(projectId, projectEpoch, requestSignal);
+        committed = true;
+        return publicGeneration(job);
+      } finally {
+        if (this.uploadControllers.get(projectId) === controller) {
+          this.uploadControllers.delete(projectId);
+        }
+        if (!committed) {
+          if (jobCreated) await this.jobs.delete(requestId).catch(() => undefined);
+          if (staged) await this.media.discardUploadedFirstFrame(staged);
+        }
+      }
+    });
+  }
+
   async createVideo(input: {
     cameraFixed: boolean;
     duration: number;
@@ -250,6 +367,7 @@ export class GenerationService {
       cameraFixed: input.cameraFixed,
       duration: input.duration,
       imageRequestId: source.providerRequestId,
+      imageSourceKind: source.providerImageKind === "upload" ? "upload" : "generation",
       prompt: input.prompt,
       resolution: input.resolution,
     };
@@ -309,9 +427,9 @@ export class GenerationService {
     );
   }
 
-  async resumePendingJobs() {
-    const jobs = await this.jobs.list();
-    for (const job of jobs) {
+  async resumePendingJobs(jobs?: readonly GenerationJob[]) {
+    const persistedJobs = jobs ?? await this.jobs.list();
+    for (const job of persistedJobs) {
       const recheckLegacyFailure = !this.options.mockMode && isLegacyStatusFailure(job);
       if (!TERMINAL_STATUSES.has(job.status) || recheckLegacyFailure) {
         this.enqueue(job.requestId, recheckLegacyFailure);
@@ -323,7 +441,8 @@ export class GenerationService {
     assertProjectId(projectId);
     const existing = this.deletingProjects.get(projectId);
     if (existing) return existing;
-    const operation = (async () => {
+    this.uploadControllers.get(projectId)?.abort();
+    const operation = this.serializeProjectMutation(projectId, async () => {
       this.projectEpochs.set(projectId, (this.projectEpochs.get(projectId) ?? 0) + 1);
       const projectJobs = (await this.jobs.list()).filter((job) => job.projectId === projectId);
       const activeWorkers = projectJobs.flatMap((job) => {
@@ -335,7 +454,7 @@ export class GenerationService {
       const deletedJobs = await this.jobs.deleteProject(projectId);
       await this.media.deleteProject(projectId);
       return deletedJobs;
-    })();
+    });
     this.deletingProjects.set(projectId, operation);
     try {
       return await operation;

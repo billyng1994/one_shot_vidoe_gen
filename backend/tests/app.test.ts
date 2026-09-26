@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -8,6 +8,7 @@ import sharp from "sharp";
 
 import { createBackendRuntime } from "../src/app.js";
 import type { BackendConfig } from "../src/config.js";
+import type { ProviderAdapter } from "../src/generation-service.js";
 
 const PASSWORD = "correct horse battery staple";
 const SETUP_TOKEN = "test-only-bootstrap-token-at-least-32-bytes";
@@ -423,6 +424,161 @@ describe("Express backend API", () => {
       .field("title", "Safe title")
       .expect(400);
     expect(render.body.error).toMatch(/backend-managed media/);
+  });
+
+  it("creates a durable first-frame job from an authenticated image upload", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "backend-first-frame-upload-test-"));
+    temporaryDirectories.push(dataDir);
+    const runtime = createBackendRuntime(config(dataDir));
+    await runtime.initialize();
+    const adminAgent = request.agent(runtime.app);
+    const admin = await bootstrap(adminAgent);
+    const project = await createProject(adminAgent, admin.csrfToken, "Uploaded first frame");
+    const projectId = project.body.id as string;
+    const jpeg = await sharp({
+      create: { width: 1_600, height: 900, channels: 3, background: "#396dc8" },
+    }).jpeg().toBuffer();
+
+    await request(runtime.app)
+      .post(`/api/projects/${projectId}/first-frame`)
+      .attach("image", jpeg, { filename: "first-frame.jpg", contentType: "image/jpeg" })
+      .expect(401, { error: "Authentication is required.", code: "AUTH_REQUIRED" });
+    await adminAgent
+      .post(`/api/projects/${projectId}/first-frame`)
+      .set("X-OneTake-Request", "1")
+      .attach("image", jpeg, { filename: "first-frame.jpg", contentType: "image/jpeg" })
+      .expect(403, { error: "The request could not be verified.", code: "CSRF_INVALID" });
+
+    const uploaded = await browserMutation(
+      adminAgent.post(`/api/projects/${projectId}/first-frame`),
+      admin.csrfToken,
+    ).attach("image", jpeg, { filename: "first-frame.jpg", contentType: "image/jpeg" });
+
+    expect(uploaded.status, JSON.stringify(uploaded.body)).toBe(201);
+    expect(uploaded.body).toMatchObject({
+      status: "completed",
+      request_id: expect.stringMatching(/^gen-image-/),
+      images: [{
+        url: expect.stringMatching(
+          new RegExp(`^/media/${projectId}/images/gen-image-[0-9a-f-]+\\.uploaded\\.png$`),
+        ),
+      }],
+    });
+    const imageUrl = uploaded.body.images[0].url as string;
+    const stored = await adminAgent.get(imageUrl).expect(200);
+    expect(await sharp(stored.body as Buffer).metadata()).toMatchObject({
+      format: "png",
+      width: 1080,
+      height: 1080,
+    });
+    await adminAgent
+      .get(`/api/generations/${uploaded.body.request_id as string}`)
+      .expect(200)
+      .expect(({ body }) => expect(body).toEqual(uploaded.body));
+
+    const video = await browserMutation(
+      adminAgent.post("/api/generations/video"),
+      admin.csrfToken,
+    )
+      .send({
+        projectId,
+        prompt: "A gentle push in",
+        imageRequestId: uploaded.body.request_id,
+        duration: 5,
+        resolution: "720",
+        cameraFixed: false,
+      })
+      .expect(202);
+    await waitForCompleted(adminAgent, video.body.request_id as string);
+
+    await browserMutation(
+      adminAgent.delete(`/api/projects/${projectId}`),
+      admin.csrfToken,
+    ).expect(200);
+    await expect(runtime.jobs.read(uploaded.body.request_id as string)).rejects.toMatchObject({
+      status: 404,
+      code: "JOB_NOT_FOUND",
+    });
+    await expect(
+      runtime.media.resolveFile(imageUrl.slice("/media/".length)),
+    ).rejects.toMatchObject({ status: 404, code: "MEDIA_NOT_FOUND" });
+  });
+
+  it("cancels and rolls back a first-frame upload when the client disconnects", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "backend-first-frame-abort-test-"));
+    temporaryDirectories.push(dataDir);
+    let markUploadStarted!: () => void;
+    let markUploadStopped!: () => void;
+    const uploadStarted = new Promise<void>((resolvePromise) => {
+      markUploadStarted = resolvePromise;
+    });
+    const uploadStopped = new Promise<void>((resolvePromise) => {
+      markUploadStopped = resolvePromise;
+    });
+    let stagedPath: string | undefined;
+    let providerSignal: AbortSignal | undefined;
+    const providerImageId = "cli-image-33333333-3333-4333-8333-333333333333";
+    const provider: ProviderAdapter = {
+      findRecentImage: async () => undefined,
+      findRecentVideo: async () => undefined,
+      getGeneration: async () => ({ status: "canceled", request_id: providerImageId }),
+      health: async () => ({ installed: true, authenticated: true, version: "test" }),
+      imageModel: () => "gpt_image_2",
+      submitImage: async () => ({ status: "queued", request_id: providerImageId }),
+      submitVideo: async () => ({
+        status: "queued",
+        request_id: "cli-video-44444444-4444-4444-8444-444444444444",
+      }),
+      uploadImage: async (path, signal) => {
+        stagedPath = path;
+        providerSignal = signal;
+        markUploadStarted();
+        await new Promise<void>((resolvePromise) => {
+          if (signal?.aborted) resolvePromise();
+          else signal?.addEventListener("abort", () => resolvePromise(), { once: true });
+        });
+        markUploadStopped();
+        return providerImageId;
+      },
+      videoModel: () => "seedance_2_0",
+    };
+    const runtime = createBackendRuntime(
+      { ...config(dataDir), mockMode: false },
+      { provider },
+    );
+    await runtime.initialize();
+    const adminAgent = request.agent(runtime.app);
+    const admin = await bootstrap(adminAgent);
+    const project = await createProject(adminAgent, admin.csrfToken, "Abandoned upload");
+    const jpeg = await sharp({
+      create: { width: 1_600, height: 900, channels: 3, background: "#396dc8" },
+    }).jpeg().toBuffer();
+    const upload = browserMutation(
+      adminAgent.post(`/api/projects/${project.body.id as string}/first-frame`),
+      admin.csrfToken,
+    ).attach("image", jpeg, { filename: "first-frame.jpg", contentType: "image/jpeg" });
+    const requestFinished = upload.then(
+      () => "completed" as const,
+      () => "aborted" as const,
+    );
+
+    await uploadStarted;
+    upload.abort();
+    await uploadStopped;
+    await expect(requestFinished).resolves.toBe("aborted");
+    expect(providerSignal?.aborted).toBe(true);
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if ((await runtime.jobs.list()).length === 0) {
+        try {
+          if (stagedPath) await stat(stagedPath);
+        } catch {
+          break;
+        }
+      }
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 5));
+    }
+    expect(await runtime.jobs.list()).toEqual([]);
+    await expect(stat(stagedPath!)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("accepts only authenticated project-owned raster overlay uploads", async () => {

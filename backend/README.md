@@ -20,6 +20,8 @@ The API intentionally has no separate user-authentication layer. Keep it on loop
 
 - `GET /api/health` (`?check=liveness` skips CLI checks)
 - `POST /api/generations/image` with `{ projectId, prompt }`
+- `POST /api/projects/:projectId/first-frame` as multipart form data with `image`; the
+  image is center-cropped/resized to a 1080 × 1080 PNG and returned as a completed image job
 - `POST /api/generations/video` with `{ projectId, prompt, imageRequestId, duration, resolution, cameraFixed }`
 - `GET /api/generations/:requestId`
 - `POST /api/render` as multipart form data with `projectId`, `videoUrl`, title placement fields, and optional `music`

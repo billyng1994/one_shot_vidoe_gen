@@ -39,6 +39,7 @@ export type GenerationJob = {
   status: GenerationStatus;
   createdAt: string;
   updatedAt: string;
+  providerImageKind?: "generation" | "upload";
   sourceImageRequestId?: string;
   videoOptions?: {
     cameraFixed: boolean;
@@ -112,6 +113,14 @@ export function parseGenerationJob(value: unknown, expectedRequestId?: string): 
     }
   }
 
+  if (
+    parsed.providerImageKind !== undefined &&
+    (parsed.kind !== "image" ||
+      (parsed.providerImageKind !== "generation" && parsed.providerImageKind !== "upload"))
+  ) {
+    throw new BackendError("The provider image kind is invalid.", 500, "CORRUPT_JOB_RECORD");
+  }
+
   const options = record(parsed.videoOptions);
   const videoOptions = options
     ? {
@@ -140,6 +149,9 @@ export function parseGenerationJob(value: unknown, expectedRequestId?: string): 
     status: parsed.status as GenerationStatus,
     createdAt: parsed.createdAt,
     updatedAt: parsed.updatedAt,
+    ...(parsed.providerImageKind === "generation" || parsed.providerImageKind === "upload"
+      ? { providerImageKind: parsed.providerImageKind }
+      : {}),
     ...(typeof parsed.sourceImageRequestId === "string"
       ? { sourceImageRequestId: parsed.sourceImageRequestId }
       : {}),
@@ -244,6 +256,19 @@ export class JobStore {
     this.locks.set(requestId, operation);
     try {
       return await operation;
+    } finally {
+      if (this.locks.get(requestId) === operation) this.locks.delete(requestId);
+    }
+  }
+
+  async delete(requestId: string) {
+    const previous = this.locks.get(requestId) ?? Promise.resolve();
+    const operation = previous.catch(() => undefined).then(async () => {
+      await rm(this.jobPath(requestId), { force: true });
+    });
+    this.locks.set(requestId, operation);
+    try {
+      await operation;
     } finally {
       if (this.locks.get(requestId) === operation) this.locks.delete(requestId);
     }

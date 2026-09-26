@@ -6,6 +6,7 @@ import {
   HiggsfieldError,
   submitHiggsfieldImage,
   submitHiggsfieldVideo,
+  uploadHiggsfieldImage,
   type CliRunner,
 } from "../src/higgsfield.js";
 
@@ -217,6 +218,53 @@ describe("backend Higgsfield CLI adapter", () => {
     const args = runner.mock.calls[6]?.[0] ?? [];
     expect(args).toContain(`--start-image=${IMAGE_JOB_ID}`);
     expect(args.join("\n")).not.toContain("cdn.example");
+  });
+
+  it("uploads a local first frame and returns an opaque provider image ID", async () => {
+    const runner = vi
+      .fn<CliRunner>()
+      .mockImplementationOnce(() => result({ help: true }))
+      .mockImplementationOnce(() => result({ help: true }))
+      .mockImplementationOnce(() => result({ authenticated: true }))
+      .mockImplementationOnce(() => result({ media: { id: IMAGE_JOB_ID } }));
+
+    await expect(uploadHiggsfieldImage("/safe/first-frame.png", { runner })).resolves.toBe(
+      `cli-image-${IMAGE_JOB_ID}`,
+    );
+    expect(runner.mock.calls[3]?.[0]).toEqual([
+      "--json",
+      "--no-color",
+      "upload",
+      "create",
+      "/safe/first-frame.png",
+    ]);
+  });
+
+  it("uses a provider upload UUID without looking it up as a generation job", async () => {
+    const runner = vi
+      .fn<CliRunner>()
+      .mockImplementationOnce(() => result({ help: true }))
+      .mockImplementationOnce(() => result({ help: true }))
+      .mockImplementationOnce(() => result({ authenticated: true }))
+      .mockImplementationOnce(() => result({ help: true }))
+      .mockImplementationOnce(() => result(schema("seedance_2_0", "video")))
+      .mockImplementationOnce(() => result({ id: VIDEO_JOB_ID, job_type: "seedance_2_0" }));
+
+    await submitHiggsfieldVideo(
+      {
+        cameraFixed: false,
+        duration: 5,
+        imageRequestId: `cli-image-${IMAGE_JOB_ID}`,
+        imageSourceKind: "upload",
+        prompt: "Move slowly.",
+        resolution: "720",
+      },
+      { runner },
+    );
+
+    expect(runner).toHaveBeenCalledTimes(6);
+    expect(runner.mock.calls[5]?.[0]).toContain(`--start-image=${IMAGE_JOB_ID}`);
+    expect(runner.mock.calls.some(([args]) => args[2] === "generate" && args[3] === "get")).toBe(false);
   });
 
   it("does not find unrelated recent prompts", async () => {

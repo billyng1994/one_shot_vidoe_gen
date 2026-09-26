@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
+import sharp from "sharp";
 
 import { GenerationService, type ProviderAdapter } from "../src/generation-service.js";
 import { JobStore } from "../src/job-store.js";
@@ -63,6 +64,7 @@ describe("generation service", () => {
       imageModel: () => "gpt_image_2",
       submitImage,
       submitVideo,
+      uploadImage: vi.fn<ProviderAdapter["uploadImage"]>(),
       videoModel: () => "seedance_2_0",
     };
     const service = new GenerationService(
@@ -124,6 +126,7 @@ describe("generation service", () => {
       imageModel: () => "gpt_image_2",
       submitImage: vi.fn<ProviderAdapter["submitImage"]>(),
       submitVideo: vi.fn<ProviderAdapter["submitVideo"]>(),
+      uploadImage: vi.fn<ProviderAdapter["uploadImage"]>(),
       videoModel: () => "seedance_2_0",
     };
     const service = new GenerationService(
@@ -274,6 +277,7 @@ describe("generation service", () => {
       imageModel: () => "gpt_image_2",
       submitImage: async () => ({ status: "queued", request_id: providerImageId }),
       submitVideo: async () => ({ status: "queued", request_id: providerVideoId }),
+      uploadImage: async () => providerImageId,
       videoModel: () => "seedance_2_0",
     };
     const service = new GenerationService(
@@ -308,6 +312,170 @@ describe("generation service", () => {
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 5));
     }
     expect((await jobs.read(created.request_id)).status).toBe("canceled");
+  });
+
+  it("persists an uploaded square first frame and passes its provider upload ID to video", async () => {
+    const dataDirectory = await mkdtemp(join(tmpdir(), "backend-generation-test-"));
+    temporaryDirectories.push(dataDirectory);
+    const jobs = new JobStore(dataDirectory);
+    const media = new MediaStorage(
+      dataDirectory,
+      assetsDirectory,
+      { image: 5 * 1024 * 1024, video: 5 * 1024 * 1024 },
+    );
+    const providerImageId = "cli-image-33333333-3333-4333-8333-333333333333";
+    const providerVideoId = "cli-video-44444444-4444-4444-8444-444444444444";
+    const uploadImage = vi.fn<ProviderAdapter["uploadImage"]>(async (path) => {
+      await expect(sharp(path).metadata()).resolves.toMatchObject({
+        format: "png",
+        width: 1080,
+        height: 1080,
+      });
+      return providerImageId;
+    });
+    const findRecentVideo = vi.fn<ProviderAdapter["findRecentVideo"]>(async () => ({
+      status: "queued",
+      request_id: providerVideoId,
+    }));
+    const provider: ProviderAdapter = {
+      findRecentImage: async () => undefined,
+      findRecentVideo,
+      getGeneration: async () => ({ status: "canceled", request_id: providerVideoId }),
+      health: async () => ({ installed: true, authenticated: true, version: "test" }),
+      imageModel: () => "gpt_image_2",
+      submitImage: async () => ({ status: "queued", request_id: providerImageId }),
+      submitVideo: async () => ({ status: "queued", request_id: providerVideoId }),
+      uploadImage,
+      videoModel: () => "seedance_2_0",
+    };
+    const service = new GenerationService(
+      jobs,
+      media,
+      {
+        cliConcurrency: 1,
+        mockMode: false,
+        pollInitialDelayMs: 1,
+        pollMaxDelayMs: 2,
+        pollWindowMs: 1_000,
+      },
+      provider,
+    );
+    await service.initialize();
+    const source = await sharp({
+      create: { width: 1_600, height: 900, channels: 3, background: "#396dc8" },
+    }).jpeg().toBuffer();
+
+    const uploaded = await service.createUploadedImage(PROJECT_ID, source);
+
+    expect(uploaded).toMatchObject({
+      status: "completed",
+      images: [{ url: expect.stringMatching(/^\/media\/.+\/images\/gen-image-/) }],
+    });
+    expect(uploadImage).toHaveBeenCalledTimes(1);
+    const uploadedJob = await jobs.read(uploaded.request_id);
+    expect(uploadedJob).toMatchObject({
+      providerRequestId: providerImageId,
+      providerImageKind: "upload",
+      status: "completed",
+    });
+
+    const video = await service.createVideo({
+      cameraFixed: false,
+      duration: 5,
+      imageRequestId: uploaded.request_id,
+      projectId: PROJECT_ID,
+      prompt: "A gentle motion",
+      resolution: "720",
+    });
+    expect(findRecentVideo).toHaveBeenCalledWith(expect.objectContaining({
+      imageRequestId: providerImageId,
+      imageSourceKind: "upload",
+    }));
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if ((await jobs.read(video.request_id)).status === "canceled") break;
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 5));
+    }
+    expect((await jobs.read(video.request_id)).status).toBe("canceled");
+  });
+
+  it("serializes an uploaded first-frame commit with project deletion", async () => {
+    const dataDirectory = await mkdtemp(join(tmpdir(), "backend-generation-test-"));
+    temporaryDirectories.push(dataDirectory);
+    let releaseCreate!: () => void;
+    let markCreateStarted!: () => void;
+    const createStarted = new Promise<void>((resolvePromise) => {
+      markCreateStarted = resolvePromise;
+    });
+    const createGate = new Promise<void>((resolvePromise) => {
+      releaseCreate = resolvePromise;
+    });
+    class SlowJobStore extends JobStore {
+      override async create(job: Parameters<JobStore["create"]>[0]) {
+        if (job.providerImageKind === "upload") {
+          markCreateStarted();
+          await createGate;
+        }
+        return super.create(job);
+      }
+    }
+    const jobs = new SlowJobStore(dataDirectory);
+    const media = new MediaStorage(
+      dataDirectory,
+      assetsDirectory,
+      { image: 5 * 1024 * 1024, video: 5 * 1024 * 1024 },
+    );
+    const providerImageId = "cli-image-33333333-3333-4333-8333-333333333333";
+    const provider: ProviderAdapter = {
+      findRecentImage: async () => undefined,
+      findRecentVideo: async () => undefined,
+      getGeneration: async () => ({ status: "canceled", request_id: providerImageId }),
+      health: async () => ({ installed: true, authenticated: true, version: "test" }),
+      imageModel: () => "gpt_image_2",
+      submitImage: async () => ({ status: "queued", request_id: providerImageId }),
+      submitVideo: vi.fn<ProviderAdapter["submitVideo"]>(),
+      uploadImage: async () => providerImageId,
+      videoModel: () => "seedance_2_0",
+    };
+    const service = new GenerationService(
+      jobs,
+      media,
+      {
+        cliConcurrency: 1,
+        mockMode: false,
+        pollInitialDelayMs: 1,
+        pollMaxDelayMs: 2,
+        pollWindowMs: 1_000,
+      },
+      provider,
+    );
+    await service.initialize();
+    const source = await sharp({
+      create: { width: 1_600, height: 900, channels: 3, background: "#396dc8" },
+    }).jpeg().toBuffer();
+
+    const upload = service.createUploadedImage(PROJECT_ID, source);
+    await createStarted;
+    let deletionFinished = false;
+    const deletion = service.deleteProject(PROJECT_ID).then((count) => {
+      deletionFinished = true;
+      return count;
+    });
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 5));
+    expect(deletionFinished).toBe(false);
+
+    const uploadError = upload.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    releaseCreate();
+    const [error, deletedJobs] = await Promise.all([uploadError, deletion]);
+
+    expect(error).toMatchObject({ status: 409, code: "PROJECT_DELETED" });
+    expect(deletedJobs).toBe(0);
+    expect(await jobs.list()).toEqual([]);
+    await expect(stat(join(dataDirectory, "media", PROJECT_ID))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
   });
 
   it("waits for an active worker before project cleanup so files cannot reappear", async () => {

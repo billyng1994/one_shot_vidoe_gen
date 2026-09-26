@@ -47,6 +47,7 @@ export type VideoGenerationInput = {
   cameraFixed: boolean;
   duration: number;
   imageRequestId: string;
+  imageSourceKind?: "generation" | "upload";
   prompt: string;
   resolution: "720" | "1080";
 };
@@ -56,7 +57,9 @@ type CliJob = {
   created_at?: unknown;
   duration?: unknown;
   id?: unknown;
+  media_id?: unknown;
   request_id?: unknown;
+  upload_id?: unknown;
   job_id?: unknown;
   status?: unknown;
   state?: unknown;
@@ -69,6 +72,8 @@ type CliJob = {
   name?: unknown;
   result?: unknown;
   output?: unknown;
+  media?: unknown;
+  upload?: unknown;
   data?: unknown;
   job?: unknown;
   job_type?: unknown;
@@ -566,6 +571,39 @@ function extractJobId(job: CliJob) {
   return id;
 }
 
+function extractUploadId(value: unknown) {
+  if (typeof value === "string" && JOB_ID_PATTERN.test(value)) return value;
+  const upload = nestedRecord(value);
+  const nested = nestedRecord(upload?.upload)
+    ?? nestedRecord(upload?.media)
+    ?? nestedRecord(upload?.data);
+  const id = stringValue(
+    upload?.id,
+    upload?.upload_id,
+    upload?.media_id,
+    nested?.id,
+    nested?.upload_id,
+    nested?.media_id,
+  );
+  if (id && JOB_ID_PATTERN.test(id)) return id;
+  return undefined;
+}
+
+function parseUploadOutput(stdout: string) {
+  try {
+    const value = JSON.parse(stdout.trim()) as unknown;
+    const candidate = Array.isArray(value) && value.length === 1 ? value[0] : value;
+    const id = extractUploadId(candidate);
+    if (id) return id;
+  } catch {
+    // Fall through to the CLI's human-readable success format below.
+  }
+
+  const ids = [...new Set(stdout.match(JOB_ID_TOKEN_PATTERN) ?? [])];
+  if (ids.length === 1) return ids[0]!;
+  throw new HiggsfieldError("Higgsfield CLI did not return a valid upload ID.", 502);
+}
+
 function extractResultUrl(job: CliJob) {
   const result = nestedRecord(job.result);
   const output = nestedRecord(job.output);
@@ -842,6 +880,22 @@ export async function submitHiggsfieldImage(
   return normalizeJob(job, "image");
 }
 
+export async function uploadHiggsfieldImage(
+  filePath: string,
+  options: { runner?: CliRunner; signal?: AbortSignal } = {},
+) {
+  if (!filePath || filePath.includes("\0")) {
+    throw new HiggsfieldError("The first-frame image path is invalid.", 500);
+  }
+  const runner = options.runner ?? runHiggsfieldCli;
+  await requireCliAuthentication(runner, options.signal);
+  const result = await runner(
+    ["--json", "--no-color", "upload", "create", filePath],
+    { signal: options.signal, timeoutMs: 90_000 },
+  );
+  return publicRequestId("image", parseUploadOutput(result.stdout));
+}
+
 async function getRawCliJob(jobId: string, runner: CliRunner, signal?: AbortSignal) {
   const result = await runner(
     ["--json", "--no-color", "generate", "get", jobId],
@@ -863,13 +917,15 @@ export async function submitHiggsfieldVideo(
   }
 
   await preflightModel(model, runner, options.signal);
-  const sourceJob = normalizeJob(
-    await getRawCliJob(source.jobId, runner, options.signal),
-    "image",
-    source.jobId,
-  );
-  if (sourceJob.status !== "completed" || !sourceJob.images?.[0]?.url) {
-    throw new HiggsfieldError("The first-frame image job is not completed.", 409);
+  if ((input.imageSourceKind ?? "generation") === "generation") {
+    const sourceJob = normalizeJob(
+      await getRawCliJob(source.jobId, runner, options.signal),
+      "image",
+      source.jobId,
+    );
+    if (sourceJob.status !== "completed" || !sourceJob.images?.[0]?.url) {
+      throw new HiggsfieldError("The first-frame image job is not completed.", 409);
+    }
   }
 
   const prompt = effectiveVideoPrompt(input);
