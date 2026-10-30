@@ -802,4 +802,114 @@ describe("Express backend API", () => {
       .get("/api/composition-templates")
       .expect(200, { templates: [] });
   });
+
+  it("serves and optimistically edits a template with template-owned uploads", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "backend-template-editor-api-test-"));
+    temporaryDirectories.push(dataDir);
+    const runtime = createBackendRuntime(config(dataDir));
+    await runtime.initialize();
+    const adminAgent = request.agent(runtime.app);
+    const admin = await bootstrap(adminAgent);
+    const project = await createProject(adminAgent, admin.csrfToken, "Template editor source");
+    const captured = await browserMutation(
+      adminAgent.post("/api/composition-templates"),
+      admin.csrfToken,
+    ).send({
+      name: "Editable frame",
+      sourceProjectId: project.body.id,
+      expectedProjectUpdatedAt: project.body.updatedAt,
+    }).expect(201);
+    const templateUrl = `/api/composition-templates/${captured.body.id as string}`;
+
+    const original = await adminAgent.get(templateUrl).expect(200);
+    expect(original.body).toMatchObject({
+      id: captured.body.id,
+      name: "Editable frame",
+      layerCount: 2,
+      layers: [
+        { id: "brand-logo", role: "logo", src: "/gostudy-logo.svg" },
+        { id: "text-1", type: "text" },
+      ],
+    });
+
+    const jpeg = await sharp({
+      create: { width: 120, height: 80, channels: 3, background: "#396dc8" },
+    }).jpeg().toBuffer();
+    const uploaded = await browserMutation(
+      adminAgent.post(`${templateUrl}/assets`),
+      admin.csrfToken,
+    ).attach("image", jpeg, { filename: "background.jpg", contentType: "image/jpeg" })
+      .expect(201);
+    expect(uploaded.body).toMatchObject({
+      assetId: expect.stringMatching(/^[0-9a-f-]{36}$/),
+      url: expect.stringMatching(
+        new RegExp(`^${templateUrl}/assets/[0-9a-f-]{36}$`),
+      ),
+      width: 120,
+      height: 80,
+    });
+    await request(runtime.app).get(uploaded.body.url as string).expect(401);
+    await adminAgent
+      .get(uploaded.body.url as string)
+      .expect("Content-Type", /image\/png/)
+      .expect(200);
+    await adminAgent.head(uploaded.body.url as string).expect(200);
+    const discarded = await browserMutation(
+      adminAgent.post(`${templateUrl}/assets`),
+      admin.csrfToken,
+    ).attach("image", jpeg, { filename: "discarded.jpg", contentType: "image/jpeg" })
+      .expect(201);
+    await browserMutation(
+      adminAgent.delete(discarded.body.url as string),
+      admin.csrfToken,
+    ).expect(200, { deleted: true });
+    await adminAgent.get(discarded.body.url as string).expect(404);
+
+    const updated = await browserMutation(
+      adminAgent.patch(templateUrl),
+      admin.csrfToken,
+    ).send({
+      name: "Edited frame",
+      expectedTemplateUpdatedAt: original.body.updatedAt,
+      layers: [
+        {
+          id: "background-1",
+          type: "image",
+          role: "background",
+          name: "Background",
+          src: uploaded.body.url,
+          x: 0,
+          y: 0,
+          width: 1.875,
+          aspectRatio: 1.5,
+          mask: "none",
+        },
+        ...original.body.layers,
+      ],
+    }).expect(200);
+    expect(updated.body).toMatchObject({
+      id: captured.body.id,
+      name: "Edited frame",
+      layerCount: 3,
+      layers: [
+        { id: "background-1", role: "background", src: uploaded.body.url },
+        { id: "brand-logo", role: "logo" },
+        { id: "text-1", type: "text" },
+      ],
+    });
+    await browserMutation(
+      adminAgent.delete(uploaded.body.url as string),
+      admin.csrfToken,
+    ).expect(409).expect(({ body }) => {
+      expect(body).toMatchObject({ code: "TEMPLATE_ASSET_IN_USE" });
+    });
+    await browserMutation(adminAgent.patch(templateUrl), admin.csrfToken)
+      .send({
+        name: "Stale edit",
+        expectedTemplateUpdatedAt: original.body.updatedAt,
+        layers: updated.body.layers,
+      })
+      .expect(409)
+      .expect(({ body }) => expect(body).toMatchObject({ code: "TEMPLATE_CONFLICT" }));
+  });
 });

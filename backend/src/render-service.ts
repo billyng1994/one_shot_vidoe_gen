@@ -9,6 +9,7 @@ import sharp from "sharp";
 import {
   DEFAULT_LOGO_SRC,
   MAX_IMAGE_ASPECT_RATIO,
+  MEDIA_RECT,
   MIN_IMAGE_LAYER_WIDTH,
   MIN_IMAGE_ASPECT_RATIO,
   OUTPUT_SIZE,
@@ -243,17 +244,17 @@ export class RenderService {
 
   private async imageLayerComposite(layer: ImageLayer, projectId: string) {
     const source = await this.imageLayerSource(layer, projectId);
-    const left = Math.min(
-      OUTPUT_SIZE.width - 1,
-      Math.round(clampNumber(layer.x, 0, 1) * OUTPUT_SIZE.width),
-    );
-    const top = Math.min(
-      OUTPUT_SIZE.height - 1,
-      Math.round(clampNumber(layer.y, 0, 1) * OUTPUT_SIZE.height),
-    );
+    const rawLeft = Math.round(layer.x * OUTPUT_SIZE.width);
+    const rawTop = Math.round(layer.y * OUTPUT_SIZE.height);
+    const left = Math.min(OUTPUT_SIZE.width - 1, Math.max(0, rawLeft));
+    const top = Math.min(OUTPUT_SIZE.height - 1, Math.max(0, rawTop));
     const width = Math.max(
       1,
-      Math.round(clampNumber(layer.width, MIN_IMAGE_LAYER_WIDTH, 1) * OUTPUT_SIZE.width),
+      Math.round(
+        (layer.role === "background"
+          ? layer.width
+          : clampNumber(layer.width, MIN_IMAGE_LAYER_WIDTH, 1)) * OUTPUT_SIZE.width,
+      ),
     );
     const height = layer.mask === "circle"
       ? width
@@ -281,11 +282,16 @@ export class RenderService {
         .toBuffer();
     }
 
-    const visibleWidth = Math.min(width, OUTPUT_SIZE.width - left);
-    const visibleHeight = Math.min(height, OUTPUT_SIZE.height - top);
-    if (visibleWidth !== width || visibleHeight !== height) {
+    const cropLeft = Math.max(0, -rawLeft);
+    const cropTop = Math.max(0, -rawTop);
+    const visibleWidth = Math.min(width - cropLeft, OUTPUT_SIZE.width - left);
+    const visibleHeight = Math.min(height - cropTop, OUTPUT_SIZE.height - top);
+    if (
+      cropLeft !== 0 || cropTop !== 0 ||
+      visibleWidth !== width || visibleHeight !== height
+    ) {
       image = await sharp(image)
-        .extract({ left: 0, top: 0, width: visibleWidth, height: visibleHeight })
+        .extract({ left: cropLeft, top: cropTop, width: visibleWidth, height: visibleHeight })
         .png()
         .toBuffer();
     }
@@ -293,15 +299,42 @@ export class RenderService {
   }
 
   private async createOverlay(layers: CompositionLayer[], projectId: string, destination: string) {
-    const composites: Array<{ input: Buffer; left: number; top: number }> = [];
-    for (const layer of layers) {
+    const composites: sharp.OverlayOptions[] = [];
+    const background = layers[0]?.type === "image" && layers[0].role === "background"
+      ? layers[0]
+      : undefined;
+    if (background) {
+      composites.push(await this.imageLayerComposite(background, projectId));
+      composites.push({
+        input: Buffer.from(`
+<svg xmlns="http://www.w3.org/2000/svg" width="${MEDIA_RECT.width}" height="${MEDIA_RECT.height}">
+  <rect width="100%" height="100%" fill="#fff"/>
+</svg>`.trim()),
+        left: MEDIA_RECT.x,
+        top: MEDIA_RECT.y,
+        blend: "dest-out",
+      });
+    }
+    composites.push({
+      input: Buffer.from(createFrameSvg({ transparentPanels: Boolean(background) })),
+      left: 0,
+      top: 0,
+    });
+    for (const layer of background ? layers.slice(1) : layers) {
       if (layer.type === "text") {
         composites.push({ input: Buffer.from(createTextLayerSvg(layer)), left: 0, top: 0 });
       } else {
         composites.push(await this.imageLayerComposite(layer, projectId));
       }
     }
-    await sharp(Buffer.from(createFrameSvg()))
+    await sharp({
+      create: {
+        width: OUTPUT_SIZE.width,
+        height: OUTPUT_SIZE.height,
+        channels: 4,
+        background: { r: 0, g: 0, b: 0, alpha: 0 },
+      },
+    })
       .composite(composites)
       .png()
       .toFile(destination);

@@ -9,6 +9,7 @@ import {
   FolderOpen,
   Image as ImageIcon,
   KeyRound,
+  LayoutTemplate,
   LoaderCircle,
   LockKeyhole,
   Move,
@@ -53,12 +54,13 @@ import {
   MAX_COMPOSITION_LAYERS,
   maximumImageLayerWidth,
   MIN_IMAGE_ASPECT_RATIO,
-  MIN_IMAGE_LAYER_WIDTH,
   OUTPUT_SIZE,
   positionLayer,
   wrappedTextLines,
   type CompositionLayer,
   type ImageLayer,
+  createBackgroundLayer,
+  minimumImageLayerWidth,
 } from "@/lib/composition";
 import type {
   BackendHealth,
@@ -1516,7 +1518,14 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
     }
     const maximumWidth = maximumImageLayerWidth(layer);
     return positionLayer(
-      { ...layer, width: clampNumber(layer.width, MIN_IMAGE_LAYER_WIDTH, maximumWidth) },
+      {
+        ...layer,
+        width: clampNumber(
+          layer.width,
+          minimumImageLayerWidth(layer),
+          maximumWidth,
+        ),
+      },
       layer.x,
       layer.y,
     );
@@ -1600,6 +1609,56 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
       setSelectedLayerId(layer.id);
     } finally {
       if (uploadRevisionRef.current === uploadRevision) setAssetUploadBusy(false);
+    }
+  };
+
+  const replaceBackground = async (file: File) => {
+    const currentBackground = layers.find(
+      (layer) => layer.type === "image" && layer.role === "background",
+    );
+    if ((!currentBackground && layers.length >= MAX_COMPOSITION_LAYERS) || assetUploadBusy) return;
+    const workspaceId = activeProjectIdRef.current;
+    if (!workspaceId || requestedProjectIdRef.current !== workspaceId) {
+      throw new Error("Open a project before uploading an image.");
+    }
+    const uploadRevision = uploadRevisionRef.current + 1;
+    uploadRevisionRef.current = uploadRevision;
+    setAssetUploadBusy(true);
+    try {
+      const uploaded = await uploadCompositionImage(file, workspaceId);
+      if (
+        uploadRevisionRef.current !== uploadRevision ||
+        activeProjectIdRef.current !== workspaceId ||
+        requestedProjectIdRef.current !== workspaceId
+      ) return;
+      const baseName = file.name.replace(/\.[^.]+$/, "").trim().slice(0, 40);
+      const background = createBackgroundLayer(
+        uploaded.url,
+        uploaded.width / uploaded.height,
+        baseName || "Background photo",
+      );
+      setLayers((current) => [
+        background,
+        ...current.filter(
+          (layer) => layer.type !== "image" || layer.role !== "background",
+        ),
+      ]);
+      setSelectedLayerId(background.id);
+    } finally {
+      if (uploadRevisionRef.current === uploadRevision) setAssetUploadBusy(false);
+    }
+  };
+
+  const removeBackground = () => {
+    setLayers((current) => current.filter(
+      (layer) => layer.type !== "image" || layer.role !== "background",
+    ));
+    if (selectedLayerId === "background-photo") {
+      setSelectedLayerId(
+        layers.findLast(
+          (layer) => layer.type !== "image" || layer.role !== "background",
+        )?.id ?? "",
+      );
     }
   };
 
@@ -1783,6 +1842,10 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
     projectActionBusy ||
     !activeProjectId ||
     hydratedProjectId !== activeProjectId;
+  const backgroundLayer = layers.find(
+    (layer): layer is ImageLayer =>
+      layer.type === "image" && layer.role === "background",
+  );
   const workspaceBusy =
     imageBusy ||
     videoBusy ||
@@ -1847,6 +1910,9 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
           onStep={setStep}
         />
         <div className="header-end">
+          <Link className="template-nav-link" href="/templates">
+            <LayoutTemplate aria-hidden="true" size={14} /> Templates
+          </Link>
           <button
             className={`save-status save-status-${saveStatus}`}
             disabled={saveStatus !== "error"}
@@ -2366,9 +2432,11 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
                 onAddText={addTextLayer}
                 onChangeLayer={updateLayer}
                 onDeleteLayer={deleteLayer}
+                onRemoveBackground={removeBackground}
                 onReorderLayers={(nextLayers) => setLayers([...nextLayers])}
                 onRestoreLogo={restoreDefaultLogo}
                 onSelectLayer={setSelectedLayerId}
+                onUploadBackground={replaceBackground}
                 onUploadImage={addImageLayer}
                 onUploadLogo={replaceLogo}
                 selectedLayerId={selectedLayerId}
@@ -2430,7 +2498,7 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
               <div className="preview-toolbar">
                 <div>
                   <span className="toolbar-kicker">FINAL CANVAS</span>
-                  <strong>Drag any layer to position it</strong>
+                  <strong>Drag elements or adjust them in the inspector</strong>
                 </div>
                 <div className="toolbar-actions">
                   <span className="dimension-pill">1080 × 1350</span>
@@ -2443,6 +2511,23 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
 
               <div className="final-stage-wrap">
                 <div className="final-canvas">
+                  {backgroundLayer ? (
+                    // Project-owned image URLs are dynamic, so a native image is intentional.
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img
+                      alt=""
+                      aria-hidden="true"
+                      className="final-background"
+                      draggable={false}
+                      src={backgroundLayer.src}
+                      style={{
+                        left: `${backgroundLayer.x * 100}%`,
+                        top: `${backgroundLayer.y * 100}%`,
+                        width: `${backgroundLayer.width * 100}%`,
+                        height: `${imageLayerHeight(backgroundLayer) * 100}%`,
+                      }}
+                    />
+                  ) : null}
                   <video
                     loop
                     muted={Boolean(music)}
@@ -2455,8 +2540,16 @@ export function Studio({ initialProjectId }: { initialProjectId: string }) {
                     src={videoUrl}
                   />
                   {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img alt="" aria-hidden="true" className="frame-overlay" src="/frame-overlay.svg" />
+                  <img
+                    alt=""
+                    aria-hidden="true"
+                    className="frame-overlay"
+                    src={backgroundLayer
+                      ? "/frame-overlay-transparent.svg"
+                      : "/frame-overlay.svg"}
+                  />
                   {layers.map((layer, index) => {
+                    if (layer.type === "image" && layer.role === "background") return null;
                     const sharedProps = {
                       "aria-label": `${layer.name}. Drag or use arrow keys to move.`,
                       "aria-disabled": compositionEditingDisabled,

@@ -4,11 +4,14 @@ OneTake is a three-stage social-video workflow:
 
 1. Generate a square first frame with Higgsfield CLI and GPT Image 2, or upload and crop your own.
 2. Use that image job as frame one for Seedance 2.0.
-3. Compose layered text, logos, overlay images, and optional music, then render an H.264 MP4.
+3. Compose layered text, logos, overlay images, an adjustable full-frame background photo, and
+   optional music, then render an H.264 MP4.
 
-Step 3 compositions can be saved as account-level frame templates. Templates preserve text,
-images, styling, positions, sizes, masks, and layer order; applying one replaces only the target
-project's editable layer stack, leaving its generated video and music settings unchanged.
+Step 3 compositions can be saved as account-level frame templates. Templates preserve background
+photos, text, images, logos, styling, positions, sizes, masks, and layer order; applying one replaces
+only the target project's editable layer stack, leaving its generated video and music settings
+unchanged. The **Templates** page lists every saved template, supports full component editing, and
+can create a new project with a reusable layout already applied.
 
 ## Architecture and storage
 
@@ -49,7 +52,7 @@ backend/data/                         # default for a local backend
     <user-id>/
       <template-id>/
         template.json                 # versioned layer stack with private asset references
-        assets/*.png                  # independent copies of custom logos/overlays
+        assets/*.png                  # independent copies of backgrounds, logos, and overlays
   jobs/
     gen-image-<uuid>.json
     gen-video-<uuid>.json
@@ -288,6 +291,11 @@ first obtain the CSRF token from `GET /api/auth/session` while retaining the ses
 | User | `POST /api/projects` | Create a project |
 | User | `GET/PATCH/DELETE /api/projects/{projectId}` | Read, save, or delete an owned project |
 | User | `POST /api/projects/{projectId}/assets` | Normalize and store an owned composition image |
+| User | `GET/POST /api/composition-templates` | List templates or capture a project's Step 3 layout |
+| User | `GET/PATCH/DELETE /api/composition-templates/{templateId}` | Read, edit, or delete an owned template |
+| User | `POST /api/composition-templates/{templateId}/assets` | Normalize and add an editable template image |
+| User | `GET/HEAD/DELETE /api/composition-templates/{templateId}/assets/{assetId}` | Serve or discard an owned template image |
+| User | `POST /api/projects/{projectId}/composition/apply-template` | Copy a template's layout and assets into a project |
 | User | `POST /api/generations/image` | Submit an image generation for an owned project |
 | User | `POST /api/generations/video` | Submit a video using a completed image job |
 | User | `GET /api/generations/{requestId}` | Read an owned durable job and local media URL |
@@ -312,3 +320,5 @@ pnpm check
 ```
 
 This runs frontend and backend linting, type checks, tests, and builds both services.
+The local, git-ignored `./testing/run_tests.sh` runner additionally executes the required Chrome
+workflow and stores its logs and browser artifacts under `testing/results/`.

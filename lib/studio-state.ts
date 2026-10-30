@@ -5,13 +5,15 @@ import {
   DEFAULT_LOGO_SRC,
   DEFAULT_TITLE,
   FONT_FAMILIES,
-  imageLayerHeight,
+  imageLayerPositionBounds,
   isHexColor,
+  MAX_BACKGROUND_ASPECT_RATIO,
   MAX_IMAGE_ASPECT_RATIO,
   MAX_COMPOSITION_LAYERS,
   maximumImageLayerWidth,
+  minimumImageLayerWidth,
   MIN_IMAGE_ASPECT_RATIO,
-  MIN_IMAGE_LAYER_WIDTH,
+  MIN_BACKGROUND_ASPECT_RATIO,
   positionLayer,
   textLayerFromTitle,
   type CompositionLayer,
@@ -157,24 +159,40 @@ function normalizeTextLayer(value: Record<string, unknown>, index: number): Text
 function normalizeImageLayer(value: Record<string, unknown>, index: number): ImageLayer | null {
   const src = safeLayerImageUrl(value.src);
   if (!src) return null;
-  const role = value.role === "logo" ? "logo" : "overlay";
-  const mask = imageMask(value.mask);
+  const role: ImageLayer["role"] = value.role === "background"
+    ? "background"
+    : value.role === "logo"
+      ? "logo"
+      : "overlay";
+  const mask = role === "background" ? "none" : imageMask(value.mask);
   const aspectRatio = clampNumber(
     finiteNumber(value.aspectRatio, 1),
-    MIN_IMAGE_ASPECT_RATIO,
-    MAX_IMAGE_ASPECT_RATIO,
+    role === "background" ? MIN_BACKGROUND_ASPECT_RATIO : MIN_IMAGE_ASPECT_RATIO,
+    role === "background" ? MAX_BACKGROUND_ASPECT_RATIO : MAX_IMAGE_ASPECT_RATIO,
   );
-  const largestWidth = maximumImageLayerWidth({ mask, aspectRatio });
+  const geometry = { role, mask, aspectRatio };
+  const smallestWidth = minimumImageLayerWidth(geometry);
+  const largestWidth = maximumImageLayerWidth(geometry);
   const width = clampNumber(
-    finiteNumber(value.width, role === "logo" ? 0.267 : 0.24),
-    MIN_IMAGE_LAYER_WIDTH,
+    finiteNumber(
+      value.width,
+      role === "background" ? smallestWidth : role === "logo" ? 0.267 : 0.24,
+    ),
+    smallestWidth,
     largestWidth,
   );
   const provisional: ImageLayer = {
     id: layerId(value.id, `image-${index + 1}`),
     type: "image" as const,
     role,
-    name: layerName(value.name, role === "logo" ? "Brand logo" : `Image ${index + 1}`),
+    name: layerName(
+      value.name,
+      role === "background"
+        ? "Background photo"
+        : role === "logo"
+          ? "Brand logo"
+          : `Image ${index + 1}`,
+    ),
     src,
     x: 0,
     y: 0,
@@ -182,11 +200,26 @@ function normalizeImageLayer(value: Record<string, unknown>, index: number): Ima
     aspectRatio,
     mask,
   };
-  const height = imageLayerHeight(provisional);
+  const bounds = imageLayerPositionBounds(provisional);
   return {
     ...provisional,
-    x: clampNumber(finiteNumber(value.x, 0.38), 0, 1 - width),
-    y: clampNumber(finiteNumber(value.y, role === "logo" ? 0.02 : 0.32), 0, 1 - height),
+    x: clampNumber(
+      finiteNumber(value.x, role === "background" ? (1 - width) / 2 : 0.38),
+      bounds.minimumX,
+      bounds.maximumX,
+    ),
+    y: clampNumber(
+      finiteNumber(
+        value.y,
+        role === "background"
+          ? (bounds.minimumY + bounds.maximumY) / 2
+          : role === "logo"
+            ? 0.02
+            : 0.32,
+      ),
+      bounds.minimumY,
+      bounds.maximumY,
+    ),
   };
 }
 
@@ -194,6 +227,7 @@ function normalizeLayers(value: unknown) {
   if (!Array.isArray(value)) return createDefaultLayers();
   const seen = new Set<string>();
   let foundLogo = false;
+  let foundBackground = false;
   const layers: CompositionLayer[] = [];
 
   for (const [index, rawLayer] of value.slice(0, MAX_COMPOSITION_LAYERS).entries()) {
@@ -201,16 +235,24 @@ function normalizeLayers(value: unknown) {
     if (!candidate) continue;
     let layer: CompositionLayer | null = null;
     if (candidate.type === "text") layer = normalizeTextLayer(candidate, index);
-    if (candidate.type === "image") layer = normalizeImageLayer(candidate, index);
+    if (candidate.type === "image") {
+      const normalizedCandidate = candidate.role === "background" && foundBackground
+        ? { ...candidate, id: `image-${index + 1}`, role: "overlay" }
+        : candidate;
+      layer = normalizeImageLayer(normalizedCandidate, index);
+    }
     if (!layer) continue;
-    if (layer.type === "image" && layer.role === "logo") {
+    if (layer.type === "image" && layer.role === "background") {
+      layer = { ...layer, id: "background-photo" };
+      foundBackground = true;
+    } else if (layer.type === "image" && layer.role === "logo") {
       if (foundLogo) {
         layer = { ...layer, id: `image-${index + 1}`, role: "overlay" };
       } else {
         layer = { ...layer, id: "brand-logo" };
         foundLogo = true;
       }
-    } else if (layer.id === "brand-logo") {
+    } else if (layer.id === "brand-logo" || layer.id === "background-photo") {
       layer = { ...layer, id: `${layer.type}-${index + 1}` };
     }
     if (seen.has(layer.id)) continue;
@@ -219,7 +261,13 @@ function normalizeLayers(value: unknown) {
   }
 
   if (!foundLogo) layers.unshift(createDefaultLogoLayer());
-  return layers.slice(0, MAX_COMPOSITION_LAYERS);
+  const background = layers.find(
+    (layer) => layer.type === "image" && layer.role === "background",
+  );
+  const ordered = background
+    ? [background, ...layers.filter((layer) => layer !== background)]
+    : layers;
+  return ordered.slice(0, MAX_COMPOSITION_LAYERS);
 }
 
 function legacyTitle(value: unknown): TitlePlacement {

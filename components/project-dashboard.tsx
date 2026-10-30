@@ -6,6 +6,7 @@ import {
   Film,
   FolderOpen,
   Image as ImageIcon,
+  LayoutTemplate,
   Plus,
   Sparkles,
 } from "lucide-react";
@@ -120,6 +121,9 @@ export function ProjectDashboard() {
           <span>OneTake</span>
         </Link>
         <div className="dashboard-header-actions">
+          <Link className="dashboard-nav-link" href="/templates">
+            <LayoutTemplate aria-hidden="true" size={14} /> Templates
+          </Link>
           <span className="local-workspace-pill">
             <FolderOpen size={14} /> Projects and media stored on backend
           </span>

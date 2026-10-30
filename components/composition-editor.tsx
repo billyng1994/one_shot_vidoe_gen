@@ -27,11 +27,12 @@ import {
 import {
   clampNumber,
   DEFAULT_LOGO_SRC,
-  imageLayerHeight,
+  imageLayerPositionBounds,
   layerHeight,
   MAX_COMPOSITION_LAYERS,
   maximumImageLayerWidth,
-  MIN_IMAGE_LAYER_WIDTH,
+  minimumImageLayerWidth,
+  moveLayerOneStep,
   positionLayer,
   reorderLayersForVisualDrop,
   type CompositionLayer,
@@ -52,6 +53,8 @@ export type CompositionEditorProps = {
   disabled?: boolean;
   onSelectLayer: (layerId: string) => void;
   onAddText: () => void;
+  onUploadBackground: (file: File) => MaybePromise;
+  onRemoveBackground: () => void;
   onUploadLogo: (file: File) => MaybePromise;
   onRestoreLogo: () => void;
   onUploadImage: (file: File) => MaybePromise;
@@ -90,7 +93,11 @@ function percent(value: number) {
 
 function layerTypeLabel(layer: CompositionLayer) {
   if (layer.type === "text") return "Text";
-  return layer.role === "logo" ? "Logo" : "Image";
+  return layer.role === "background"
+    ? "Background"
+    : layer.role === "logo"
+      ? "Logo"
+      : "Image";
 }
 
 function LayerIcon({ layer }: { layer: CompositionLayer }) {
@@ -324,26 +331,33 @@ function ImageControls({
 
   const update = (patch: Partial<ImageLayer>) => {
     const next = { ...layer, ...patch };
+    const minimumWidth = minimumImageLayerWidth(next);
     const normalized = {
       ...next,
       width: clampNumber(
         next.width,
-        MIN_IMAGE_LAYER_WIDTH,
+        minimumWidth,
         maximumImageLayerWidth(next),
       ),
     };
     onChange(positionLayer(normalized, normalized.x, normalized.y));
   };
 
+  const minimumWidth = minimumImageLayerWidth(layer);
   const maximumWidth = maximumImageLayerWidth(layer);
-  const maximumX = Math.max(0, 1 - layer.width);
-  const maximumY = Math.max(0, 1 - imageLayerHeight(layer));
+  const bounds = imageLayerPositionBounds(layer);
 
   return (
     <div className="layer-inspector layer-inspector-image">
       <div className="section-title">
         <ImagePlus aria-hidden="true" size={16} />
-        <strong>{layer.role === "logo" ? "Logo settings" : "Image settings"}</strong>
+        <strong>
+          {layer.role === "background"
+            ? "Background settings"
+            : layer.role === "logo"
+              ? "Logo settings"
+              : "Image settings"}
+        </strong>
       </div>
 
       {layer.role === "overlay" ? (
@@ -373,28 +387,38 @@ function ImageControls({
       ) : null}
 
       <div className="slider-row layer-slider-row">
-        <label htmlFor={`${fieldId}-image-size`}>Size</label>
+        <label htmlFor={`${fieldId}-image-size`}>
+          {layer.role === "background" ? "Zoom" : "Size"}
+        </label>
         <input
           disabled={disabled}
           id={`${fieldId}-image-size`}
           max={maximumWidth}
-          min={MIN_IMAGE_LAYER_WIDTH}
+          min={minimumWidth}
           onChange={(event) => update({ width: event.currentTarget.valueAsNumber })}
           step="0.01"
           type="range"
           value={layer.width}
         />
-        <output htmlFor={`${fieldId}-image-size`}>{percent(layer.width)}</output>
+        <output htmlFor={`${fieldId}-image-size`}>
+          {layer.role === "background"
+            ? `${Math.round(layer.width / minimumWidth * 100)}%`
+            : percent(layer.width)}
+        </output>
       </div>
 
-      <div className="position-controls" role="group" aria-label="Image position">
+      <div
+        className="position-controls"
+        role="group"
+        aria-label={layer.role === "background" ? "Background crop position" : "Image position"}
+      >
         <div className="slider-row layer-slider-row">
           <label htmlFor={`${fieldId}-x`}>X</label>
           <input
             disabled={disabled}
             id={`${fieldId}-x`}
-            max={maximumX}
-            min="0"
+            max={bounds.maximumX}
+            min={bounds.minimumX}
             onChange={(event) => update({ x: event.currentTarget.valueAsNumber })}
             step="0.005"
             type="range"
@@ -407,8 +431,8 @@ function ImageControls({
           <input
             disabled={disabled}
             id={`${fieldId}-y`}
-            max={maximumY}
-            min="0"
+            max={bounds.maximumY}
+            min={bounds.minimumY}
             onChange={(event) => update({ y: event.currentTarget.valueAsNumber })}
             step="0.005"
             type="range"
@@ -427,6 +451,8 @@ export function CompositionEditor({
   disabled = false,
   onSelectLayer,
   onAddText,
+  onUploadBackground,
+  onRemoveBackground,
   onUploadLogo,
   onRestoreLogo,
   onUploadImage,
@@ -434,32 +460,52 @@ export function CompositionEditor({
   onReorderLayers,
   onDeleteLayer,
 }: CompositionEditorProps) {
+  const backgroundInputId = useId();
   const logoInputId = useId();
   const imageInputId = useId();
   const layerHelpId = useId();
+  const backgroundInputRef = useRef<HTMLInputElement>(null);
   const logoInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const [draggedLayerId, setDraggedLayerId] = useState<string | null>(null);
   const [dropTargetId, setDropTargetId] = useState<string | null>(null);
-  const [uploading, setUploading] = useState<"logo" | "overlay" | null>(null);
-  const [uploadError, setUploadError] = useState("");
+  const [uploading, setUploading] = useState<"background" | "logo" | "overlay" | null>(null);
+  const [uploadError, setUploadError] = useState<{
+    kind: "background" | "logo" | "overlay";
+    message: string;
+  } | null>(null);
   const [announcement, setAnnouncement] = useState("");
 
+  const background = layers.find(
+    (layer): layer is ImageLayer => layer.type === "image" && layer.role === "background",
+  );
   const logo = layers.find(
     (layer): layer is ImageLayer => layer.type === "image" && layer.role === "logo",
   );
   const selectedLayer = layers.find(({ id }) => id === selectedLayerId) ?? null;
-  const visualLayers = useMemo(() => [...layers].reverse(), [layers]);
+  const visualLayers = useMemo(
+    () => layers.filter(
+      (layer) => layer.type !== "image" || layer.role !== "background",
+    ).reverse(),
+    [layers],
+  );
   const controlsDisabled = disabled || uploading !== null;
   const layerLimitReached = layers.length >= MAX_COMPOSITION_LAYERS;
 
-  const upload = async (kind: "logo" | "overlay", file: File) => {
-    setUploadError("");
+  const upload = async (kind: "background" | "logo" | "overlay", file: File) => {
+    setUploadError(null);
     setUploading(kind);
     try {
-      await (kind === "logo" ? onUploadLogo(file) : onUploadImage(file));
+      await (kind === "background"
+        ? onUploadBackground(file)
+        : kind === "logo"
+          ? onUploadLogo(file)
+          : onUploadImage(file));
     } catch (error) {
-      setUploadError(error instanceof Error ? error.message : "The image could not be uploaded.");
+      setUploadError({
+        kind,
+        message: error instanceof Error ? error.message : "The image could not be uploaded.",
+      });
     } finally {
       setUploading(null);
     }
@@ -474,13 +520,11 @@ export function CompositionEditor({
   };
 
   const moveOneStep = (layerId: string, direction: "forward" | "backward") => {
-    const currentIndex = layers.findIndex(({ id }) => id === layerId);
-    const targetIndex = currentIndex + (direction === "forward" ? 1 : -1);
-    if (currentIndex < 0 || targetIndex < 0 || targetIndex >= layers.length) return;
-    const next = [...layers];
-    [next[currentIndex], next[targetIndex]] = [next[targetIndex]!, next[currentIndex]!];
+    const moved = layers.find(({ id }) => id === layerId);
+    if (!moved) return;
+    const next = moveLayerOneStep(layers, layerId, direction);
+    if (next.every((layer, index) => layer === layers[index])) return;
     onReorderLayers(next);
-    const moved = layers[currentIndex]!;
     setAnnouncement(
       `${moved.name} moved ${direction === "forward" ? "forward" : "backward"}.`,
     );
@@ -496,6 +540,92 @@ export function CompositionEditor({
 
   return (
     <div className="composition-editor">
+      <section
+        className="control-section background-control-section"
+        aria-labelledby={`${backgroundInputId}-heading`}
+      >
+        <div className="section-title" id={`${backgroundInputId}-heading`}>
+          <ImagePlus aria-hidden="true" size={16} />
+          <strong>Background photo</strong>
+        </div>
+        {background ? (
+          <div className="logo-control-card background-control-card">
+            {/* Template and project images are authenticated dynamic media. */}
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img alt="Current background" src={background.src} />
+            <button
+              aria-pressed={selectedLayerId === background.id}
+              className="background-control-copy"
+              disabled={controlsDisabled}
+              onClick={() => onSelectLayer(background.id)}
+              type="button"
+            >
+              <strong>{background.name}</strong>
+              <small>Adjust zoom and crop position below</small>
+            </button>
+            <div className="logo-control-actions">
+              <button
+                className="compact-upload-button"
+                disabled={controlsDisabled}
+                onClick={() => backgroundInputRef.current?.click()}
+                type="button"
+              >
+                {uploading === "background" ? (
+                  <LoaderCircle aria-hidden="true" className="spin" size={14} />
+                ) : (
+                  <Upload aria-hidden="true" size={14} />
+                )}
+                <span>{uploading === "background" ? "Uploading…" : "Replace"}</span>
+              </button>
+              <button
+                aria-label="Remove background photo"
+                className="icon-button delete-layer-button"
+                disabled={controlsDisabled}
+                onClick={onRemoveBackground}
+                title="Remove background"
+                type="button"
+              >
+                <Trash2 aria-hidden="true" size={14} />
+              </button>
+            </div>
+          </div>
+        ) : (
+          <button
+            className="background-upload-button"
+            disabled={controlsDisabled || layerLimitReached}
+            onClick={() => backgroundInputRef.current?.click()}
+            type="button"
+          >
+            {uploading === "background" ? (
+              <LoaderCircle aria-hidden="true" className="spin" size={16} />
+            ) : (
+              <Upload aria-hidden="true" size={16} />
+            )}
+            <span>
+              <strong>{uploading === "background" ? "Uploading…" : "Upload background"}</strong>
+              <small>PNG, JPG, WebP, or AVIF · adjustable zoom and position</small>
+            </span>
+          </button>
+        )}
+        <input
+          accept="image/png,image/jpeg,image/webp,image/avif"
+          className="sr-only"
+          disabled={controlsDisabled || (!background && layerLimitReached)}
+          id={backgroundInputId}
+          onChange={(event) => {
+            const file = event.currentTarget.files?.[0];
+            event.currentTarget.value = "";
+            if (file) void upload("background", file);
+          }}
+          ref={backgroundInputRef}
+          tabIndex={-1}
+          type="file"
+        />
+        {uploadError?.kind === "background" ? (
+          <p className="field-error" role="alert">{uploadError.message}</p>
+        ) : null}
+      </section>
+
       <section className="control-section logo-control-section" aria-labelledby={`${logoInputId}-heading`}>
         <div className="section-title" id={`${logoInputId}-heading`}>
           <ImagePlus aria-hidden="true" size={16} />
@@ -549,6 +679,9 @@ export function CompositionEditor({
           tabIndex={-1}
           type="file"
         />
+        {uploadError?.kind === "logo" ? (
+          <p className="field-error" role="alert">{uploadError.message}</p>
+        ) : null}
       </section>
 
       <section className="control-section add-layer-section" aria-labelledby={`${imageInputId}-heading`}>
@@ -596,7 +729,9 @@ export function CompositionEditor({
         {layerLimitReached ? (
           <p className="field-help">This composition has the maximum of {MAX_COMPOSITION_LAYERS} layers.</p>
         ) : null}
-        {uploadError ? <p className="field-error" role="alert">{uploadError}</p> : null}
+        {uploadError?.kind === "overlay" ? (
+          <p className="field-error" role="alert">{uploadError.message}</p>
+        ) : null}
       </section>
 
       {selectedLayer ? (
@@ -632,7 +767,10 @@ export function CompositionEditor({
         </p>
         <ul className="layer-list" aria-describedby={layerHelpId}>
           {visualLayers.map((layer) => {
-            const index = layers.findIndex(({ id }) => id === layer.id);
+            const movableIndex = layers.filter(
+              (candidate) => candidate.type !== "image" || candidate.role !== "background",
+            ).findIndex(({ id }) => id === layer.id);
+            const movableCount = layers.length - (background ? 1 : 0);
             const isLogo = layer.type === "image" && layer.role === "logo";
             const isSelected = layer.id === selectedLayerId;
             return (
@@ -686,7 +824,7 @@ export function CompositionEditor({
                 <div className="layer-order-actions">
                   <button
                     aria-label={`Bring ${layer.name} forward`}
-                    disabled={controlsDisabled || index === layers.length - 1}
+                    disabled={controlsDisabled || movableIndex === movableCount - 1}
                     onClick={() => moveOneStep(layer.id, "forward")}
                     title="Bring forward"
                     type="button"
@@ -695,7 +833,7 @@ export function CompositionEditor({
                   </button>
                   <button
                     aria-label={`Send ${layer.name} backward`}
-                    disabled={controlsDisabled || index === 0}
+                    disabled={controlsDisabled || movableIndex === 0}
                     onClick={() => moveOneStep(layer.id, "backward")}
                     title="Send backward"
                     type="button"

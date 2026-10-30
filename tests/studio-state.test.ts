@@ -26,6 +26,18 @@ describe("studio state persistence", () => {
       cameraFixed: true,
       layers: [
         {
+          id: "background-photo",
+          type: "image",
+          role: "background",
+          name: "Background photo",
+          src: `/media/${PROJECT_ID}/images/overlay-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee.png`,
+          x: -0.25,
+          y: 0,
+          width: 1.5,
+          aspectRatio: 1.2,
+          mask: "none",
+        },
+        {
           id: "brand-logo",
           type: "image",
           role: "logo",
@@ -227,6 +239,38 @@ describe("studio state persistence", () => {
 
     expect(restored?.layers).toHaveLength(20);
     expect(restored?.layers[0]).toMatchObject({ id: "brand-logo", role: "logo" });
+  });
+
+  it("keeps only one valid background and reserves its stable ID", () => {
+    const image = {
+      type: "image",
+      role: "background",
+      name: "Backdrop",
+      src: `/media/${PROJECT_ID}/images/overlay-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee.png`,
+      x: -0.25,
+      y: 0,
+      width: 1.5,
+      aspectRatio: 1.2,
+      mask: "none",
+    } as const;
+    const restored = parseStudioSnapshot(JSON.stringify({
+      version: 2,
+      step: 1,
+      layers: [
+        { ...image, id: "custom-background" },
+        { ...image, id: "background-photo", name: "Duplicate" },
+      ],
+    }));
+
+    expect(restored?.layers.filter(
+      (layer) => layer.type === "image" && layer.role === "background",
+    )).toEqual([
+      expect.objectContaining({ id: "background-photo", name: "Backdrop" }),
+    ]);
+    expect(restored?.layers).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "brand-logo", role: "logo" }),
+      expect.objectContaining({ id: "image-2", role: "overlay", name: "Duplicate" }),
+    ]));
   });
 
   it("ignores corrupt or unknown snapshot versions", () => {

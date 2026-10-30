@@ -455,6 +455,99 @@ export function createApp(dependencies: AppDependencies): Express {
     }),
   );
 
+  app.get(
+    "/api/composition-templates/:templateId/assets/:assetId",
+    requireAuthentication,
+    asyncRoute(async (request, response) => {
+      const ownerId = requireAuthenticatedSession(response).user.id;
+      const { assetId, templateId } = request.params;
+      if (typeof templateId !== "string" || typeof assetId !== "string") {
+        throw new BackendError("Invalid composition template asset ID.", 400, "INVALID_TEMPLATE_ID");
+      }
+      const asset = await templates.resolveAsset(ownerId, templateId, assetId);
+      response.set({
+        "Cache-Control": "private, max-age=31536000, immutable",
+        "Content-Length": String(asset.size),
+        "Content-Type": "image/png",
+      });
+      if (request.method === "HEAD") {
+        response.status(200).end();
+        return;
+      }
+      response.sendFile(asset.path);
+    }),
+  );
+
+  app.delete(
+    "/api/composition-templates/:templateId/assets/:assetId",
+    requireAuthentication,
+    csrf,
+    asyncRoute(async (request, response) => {
+      const ownerId = requireAuthenticatedSession(response).user.id;
+      const { assetId, templateId } = request.params;
+      if (typeof templateId !== "string" || typeof assetId !== "string") {
+        throw new BackendError("Invalid composition template asset ID.", 400, "INVALID_TEMPLATE_ID");
+      }
+      await templates.deleteAsset(ownerId, templateId, assetId);
+      response.json({ deleted: true });
+    }),
+  );
+
+  app.get(
+    "/api/composition-templates/:templateId",
+    requireAuthentication,
+    asyncRoute(async (request, response) => {
+      const ownerId = requireAuthenticatedSession(response).user.id;
+      const { templateId } = request.params;
+      if (typeof templateId !== "string") {
+        throw new BackendError("Invalid composition template ID.", 400, "INVALID_TEMPLATE_ID");
+      }
+      response.set("Cache-Control", "private, no-store");
+      response.json(await templates.detail(ownerId, templateId));
+    }),
+  );
+
+  const templateImageUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: {
+      fieldNameSize: 80,
+      fields: 0,
+      fileSize: config.maxImageBytes,
+      files: 1,
+      parts: 2,
+    },
+  });
+  app.post(
+    "/api/composition-templates/:templateId/assets",
+    requireAuthentication,
+    csrf,
+    asyncRoute(async (request, response, next) => {
+      const ownerId = requireAuthenticatedSession(response).user.id;
+      const { templateId } = request.params;
+      if (typeof templateId !== "string") {
+        throw new BackendError("Invalid composition template ID.", 400, "INVALID_TEMPLATE_ID");
+      }
+      await templates.get(ownerId, templateId);
+      next();
+    }),
+    templateImageUpload.single("image"),
+    asyncRoute(async (request, response) => {
+      const ownerId = requireAuthenticatedSession(response).user.id;
+      const { templateId } = request.params;
+      if (typeof templateId !== "string") {
+        throw new BackendError("Invalid composition template ID.", 400, "INVALID_TEMPLATE_ID");
+      }
+      if (!request.file) {
+        throw new BackendError("Choose an image to upload.", 400, "IMAGE_REQUIRED");
+      }
+      response.status(201).json(await templates.uploadAsset(
+        ownerId,
+        templateId,
+        request.file.buffer,
+      ));
+    }),
+  );
+
   app.post(
     "/api/composition-templates",
     requireAuthentication,
@@ -496,17 +589,16 @@ export function createApp(dependencies: AppDependencies): Express {
       }
       if (typeof body.expectedTemplateUpdatedAt !== "string") {
         throw new BackendError(
-          "The current template version is required when renaming.",
+          "The current template version is required when updating.",
           428,
           "TEMPLATE_VERSION_REQUIRED",
         );
       }
-      response.json(await templates.rename(
-        ownerId,
-        templateId,
-        body.name,
-        body.expectedTemplateUpdatedAt,
-      ));
+      response.json(await templates.update(ownerId, templateId, {
+        ...(Object.prototype.hasOwnProperty.call(body, "name") ? { name: body.name } : {}),
+        ...(Object.prototype.hasOwnProperty.call(body, "layers") ? { layers: body.layers } : {}),
+        expectedUpdatedAt: body.expectedTemplateUpdatedAt,
+      }));
     }),
   );
 

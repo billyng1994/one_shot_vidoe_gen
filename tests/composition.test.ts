@@ -1,14 +1,17 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  backgroundCoverWidth,
   BRAND_LOGO_RECT,
   clampNumber,
+  createBackgroundLayer,
   createDefaultLogoLayer,
   createOverlaySvg,
   createTextLayer,
   createTextLayerSvg,
   escapeXml,
   imageLayerHeight,
+  moveLayerOneStep,
   OUTPUT_SIZE,
   positionLayer,
   reorderLayersForVisualDrop,
@@ -64,6 +67,45 @@ describe("composition helpers", () => {
     expect(imageLayerHeight(wordmark)).toBeCloseTo(0.8 * 1080 / 1350 / 12);
   });
 
+  it("creates a centered background that covers the full canvas", () => {
+    const background = createBackgroundLayer(
+      `/media/12345678-1234-4234-8234-123456789012/images/overlay-11111111-2222-4333-8444-555555555555.png`,
+      1.5,
+      "Family portrait",
+    );
+
+    expect(background).toMatchObject({
+      id: "background-photo",
+      role: "background",
+      name: "Family portrait",
+      mask: "none",
+    });
+    expect(background.width).toBeCloseTo(1.875);
+    expect(background.x).toBeCloseTo(-0.4375);
+    expect(background.y).toBeCloseTo(0);
+    expect(imageLayerHeight(background)).toBeCloseTo(1);
+  });
+
+  it("keeps a zoomed background covering the canvas while positioning its crop", () => {
+    const background = {
+      ...createBackgroundLayer("/media/example.png", 1),
+      width: backgroundCoverWidth(1) * 2,
+    };
+
+    expect(positionLayer(background, -99, 99)).toMatchObject({ x: -1.5, y: 0 });
+    expect(positionLayer(background, 99, -99)).toMatchObject({ x: 0, y: -1 });
+  });
+
+  it("bounds extreme background aspect ratios before sizing render output", () => {
+    const panorama = createBackgroundLayer("/media/panorama.png", 100);
+    const tower = createBackgroundLayer("/media/tower.png", 0.001);
+
+    expect(panorama).toMatchObject({ aspectRatio: 3.2, width: 4, x: -1.5 });
+    expect(imageLayerHeight(panorama)).toBeCloseTo(1);
+    expect(tower).toMatchObject({ aspectRatio: 0.2, width: 1, y: -1.5 });
+    expect(imageLayerHeight(tower)).toBeCloseTo(4);
+  });
+
   it("reorders layers to both extremes using the front-first visual stack", () => {
     const layers = [
       createDefaultLogoLayer(),
@@ -75,6 +117,22 @@ describe("composition helpers", () => {
       .toEqual(["front", "brand-logo", "middle"]);
     expect(reorderLayersForVisualDrop(layers, "brand-logo", "front").map(({ id }) => id))
       .toEqual(["middle", "front", "brand-logo"]);
+  });
+
+  it("keeps the background locked behind movable layers", () => {
+    const background = createBackgroundLayer("/media/background.png", 1);
+    const layers = [
+      background,
+      createDefaultLogoLayer(),
+      createTextLayer("front", 2),
+    ];
+
+    expect(moveLayerOneStep(layers, "brand-logo", "backward").map(({ id }) => id))
+      .toEqual(["background-photo", "brand-logo", "front"]);
+    expect(moveLayerOneStep(layers, "brand-logo", "forward").map(({ id }) => id))
+      .toEqual(["background-photo", "front", "brand-logo"]);
+    expect(reorderLayersForVisualDrop(layers, "front", "brand-logo").map(({ id }) => id))
+      .toEqual(["background-photo", "front", "brand-logo"]);
   });
 
   it("escapes arbitrary text when creating a styled text layer SVG", () => {

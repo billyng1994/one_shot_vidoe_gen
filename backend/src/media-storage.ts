@@ -499,7 +499,7 @@ export class MediaStorage {
     }
   }
 
-  private async normalizeUploadedImage(bytes: Buffer, squareSize?: number) {
+  async normalizeUploadedImage(bytes: Buffer, squareSize?: number) {
     if (bytes.byteLength === 0) {
       throw new BackendError("Choose an image to upload.", 400, "EMPTY_IMAGE_UPLOAD");
     }

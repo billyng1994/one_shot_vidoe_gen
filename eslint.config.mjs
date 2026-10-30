@@ -12,5 +12,6 @@ export default defineConfig([
     "backend/dist/**",
     "coverage/**",
     "public/demo/*.mp4",
+    "testing/results/**",
   ]),
 ]);

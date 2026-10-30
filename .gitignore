@@ -16,6 +16,8 @@
 # tests and tooling
 /coverage
 /backend/coverage
+/lesson_learn/
+/testing/
 .playwright-cli/
 /output/playwright/
 *.tsbuildinfo

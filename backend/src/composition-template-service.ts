@@ -18,7 +18,10 @@ export const COMPOSITION_TEMPLATE_VERSION = 1 as const;
 export const MAX_COMPOSITION_TEMPLATES_PER_OWNER = 50;
 const MAX_TEMPLATE_NAME_LENGTH = 80;
 const MAX_TEMPLATE_ASSET_BYTES = 128 * 1024 * 1024;
+const MAX_TEMPLATE_ASSET_FILES = 100;
 const TEMPLATE_FILENAME = "template.json";
+const TEMPLATE_VALIDATION_IMAGE_SRC =
+  "/media/legacy-v1/images/overlay-00000000-0000-4000-8000-000000000000.png";
 
 type BuiltinTemplateSource = {
   kind: "builtin";
@@ -66,6 +69,10 @@ export type CompositionTemplateSummary = {
   imageLayerCount: number;
 };
 
+export type CompositionTemplateDetail = CompositionTemplateSummary & {
+  layers: CompositionLayer[];
+};
+
 export type MaterializedCompositionTemplate = {
   template: CompositionTemplateSummary;
   layers: CompositionLayer[];
@@ -75,6 +82,8 @@ export type MaterializedCompositionTemplate = {
 export type CompositionTemplateServiceOptions = {
   createId?: () => string;
   createAssetId?: () => string;
+  maxAssetBytes?: number;
+  maxAssetFiles?: number;
   now?: () => Date | string;
 };
 
@@ -168,7 +177,11 @@ function validateStoredTemplate(
     if (layer?.type !== "image") return rawLayer;
     const source = validateTemplateSource(layer.source);
     sources.set(index, source);
-    return { ...layer, source: undefined, src: DEFAULT_LOGO_SRC };
+    return {
+      ...layer,
+      source: undefined,
+      src: source.kind === "builtin" ? DEFAULT_LOGO_SRC : TEMPLATE_VALIDATION_IMAGE_SRC,
+    };
   });
   const validatedLayers = validateCompositionLayers(layersForValidation, {
     code: "CORRUPT_COMPOSITION_TEMPLATE",
@@ -206,6 +219,84 @@ function summary(template: StoredCompositionTemplate): CompositionTemplateSummar
   };
 }
 
+function templateAssetUrl(templateId: string, assetId: string) {
+  return `/api/composition-templates/${validateTemplateId(templateId)}/assets/${validateTemplateId(assetId)}`;
+}
+
+function editableTemplateLayers(value: unknown, templateId: string) {
+  if (!Array.isArray(value)) {
+    throw new BackendError(
+      "Composition template layers must be an array.",
+      400,
+      "INVALID_COMPOSITION_TEMPLATE",
+    );
+  }
+  const sources = new Map<number, TemplateImageSource>();
+  const layersForValidation = value.map((rawLayer, index) => {
+    const layer = record(rawLayer);
+    if (layer?.type !== "image") return rawLayer;
+    let source: TemplateImageSource;
+    if (layer.src === DEFAULT_LOGO_SRC) {
+      if (layer.role !== "logo") {
+        throw new BackendError(
+          "Only the logo layer can use the built-in logo.",
+          400,
+          "INVALID_COMPOSITION_TEMPLATE",
+        );
+      }
+      source = { kind: "builtin", key: "gostudy-logo" };
+    } else {
+      const match = typeof layer.src === "string"
+        ? /^\/api\/composition-templates\/([^/]+)\/assets\/([^/]+)$/.exec(layer.src)
+        : null;
+      if (!match || validateTemplateId(match[1]) !== templateId) {
+        throw new BackendError(
+          "An image layer must use an asset owned by this composition template.",
+          400,
+          "INVALID_COMPOSITION_TEMPLATE",
+        );
+      }
+      source = { kind: "asset", assetId: validateTemplateId(match[2]) };
+    }
+    sources.set(index, source);
+    return {
+      ...layer,
+      src: source.kind === "builtin" ? DEFAULT_LOGO_SRC : TEMPLATE_VALIDATION_IMAGE_SRC,
+    };
+  });
+  const validated = validateCompositionLayers(layersForValidation, {
+    code: "INVALID_COMPOSITION_TEMPLATE",
+  });
+  return validated.map((layer, index): StoredTemplateLayer => {
+    if (layer.type === "text") return layer;
+    const source = sources.get(index);
+    if (!source) {
+      throw new BackendError(
+        "A composition template image source is missing.",
+        400,
+        "INVALID_COMPOSITION_TEMPLATE",
+      );
+    }
+    return storedImageLayer(layer, source);
+  });
+}
+
+function detail(template: StoredCompositionTemplate): CompositionTemplateDetail {
+  return {
+    ...summary(template),
+    layers: template.layers.map((layer): CompositionLayer => {
+      if (layer.type === "text") return { ...layer };
+      const { source, ...image } = layer;
+      return {
+        ...image,
+        src: source.kind === "builtin"
+          ? DEFAULT_LOGO_SRC
+          : templateAssetUrl(template.id, source.assetId),
+      };
+    }),
+  };
+}
+
 function compareTemplates(left: StoredCompositionTemplate, right: StoredCompositionTemplate) {
   const updated = Date.parse(right.updatedAt) - Date.parse(left.updatedAt);
   if (updated !== 0) return updated;
@@ -218,6 +309,8 @@ export class CompositionTemplateService {
   private readonly createId: () => string;
   private readonly createAssetId: () => string;
   private readonly clock: () => Date | string;
+  private readonly maxAssetBytes: number;
+  private readonly maxAssetFiles: number;
   private readonly mutations = new Map<string, Promise<unknown>>();
 
   constructor(
@@ -229,6 +322,8 @@ export class CompositionTemplateService {
     this.createId = options.createId ?? randomUUID;
     this.createAssetId = options.createAssetId ?? randomUUID;
     this.clock = options.now ?? (() => new Date());
+    this.maxAssetBytes = options.maxAssetBytes ?? MAX_TEMPLATE_ASSET_BYTES;
+    this.maxAssetFiles = options.maxAssetFiles ?? MAX_TEMPLATE_ASSET_FILES;
   }
 
   async initialize() {
@@ -349,7 +444,7 @@ export class CompositionTemplateService {
           throw new Error("Invalid composition template asset.");
         }
         totalAssetBytes += metadata.size;
-        if (totalAssetBytes > MAX_TEMPLATE_ASSET_BYTES) {
+        if (totalAssetBytes > this.maxAssetBytes) {
           throw new Error("Composition template assets exceed the size limit.");
         }
       }
@@ -412,6 +507,73 @@ export class CompositionTemplateService {
     return template;
   }
 
+  private async verifyAssets(
+    ownerId: string,
+    templateId: string,
+    layers: StoredTemplateLayer[],
+  ) {
+    const assetIds = new Set(layers.flatMap((layer) =>
+      layer.type === "image" && layer.source.kind === "asset"
+        ? [layer.source.assetId]
+        : [],
+    ));
+    let totalAssetBytes = 0;
+    for (const assetId of assetIds) {
+      let metadata;
+      try {
+        metadata = await lstat(this.assetPath(ownerId, templateId, assetId));
+      } catch (error) {
+        if (errno(error, "ENOENT")) {
+          throw new BackendError(
+            "A saved image in this composition template is unavailable.",
+            400,
+            "INVALID_COMPOSITION_TEMPLATE",
+          );
+        }
+        throw error;
+      }
+      if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size <= 0) {
+        throw new BackendError(
+          "A saved image in this composition template is invalid.",
+          400,
+          "INVALID_COMPOSITION_TEMPLATE",
+        );
+      }
+      totalAssetBytes += metadata.size;
+      if (totalAssetBytes > this.maxAssetBytes) {
+        throw new BackendError(
+          "The images in this composition template are too large.",
+          413,
+          "TEMPLATE_ASSETS_TOO_LARGE",
+        );
+      }
+    }
+    return assetIds;
+  }
+
+  private async pruneAssets(ownerId: string, templateId: string, keep: Set<string>) {
+    const directory = join(this.templateDirectory(ownerId, templateId), "assets");
+    const entries = await readdir(directory, { withFileTypes: true });
+    await Promise.all(entries.flatMap((entry) => {
+      const match = /^([0-9a-f-]+)\.png$/i.exec(entry.name);
+      return entry.isFile() && match && UUID_PATTERN.test(match[1]!) && !keep.has(match[1]!)
+        ? [rm(join(directory, entry.name), { force: true })]
+        : [];
+    }));
+  }
+
+  private async assetUsage(ownerId: string, templateId: string) {
+    const directory = join(this.templateDirectory(ownerId, templateId), "assets");
+    const entries = await readdir(directory, { withFileTypes: true });
+    const sizes = await Promise.all(entries.flatMap((entry) =>
+      entry.isFile() ? [lstat(join(directory, entry.name)).then((metadata) => metadata.size)] : [],
+    ));
+    return {
+      bytes: sizes.reduce((total, size) => total + size, 0),
+      files: sizes.length,
+    };
+  }
+
   async list(ownerId: string) {
     validateOwnerId(ownerId);
     return (await this.listUnlocked(ownerId)).map(summary);
@@ -425,6 +587,173 @@ export class CompositionTemplateService {
       throw new BackendError("Composition template not found.", 404, "TEMPLATE_NOT_FOUND");
     }
     return template;
+  }
+
+  async detail(ownerId: string, templateId: string) {
+    return detail(await this.get(ownerId, templateId));
+  }
+
+  async resolveAsset(ownerId: string, templateId: string, assetId: string) {
+    const normalizedOwnerId = validateOwnerId(ownerId);
+    const normalizedTemplateId = validateTemplateId(templateId);
+    const normalizedAssetId = validateTemplateId(assetId);
+    await this.get(normalizedOwnerId, normalizedTemplateId);
+    const path = this.assetPath(normalizedOwnerId, normalizedTemplateId, normalizedAssetId);
+    try {
+      const metadata = await lstat(path);
+      if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size <= 0) {
+        throw new BackendError(
+          "The composition template asset is invalid.",
+          500,
+          "CORRUPT_TEMPLATE_ASSET",
+        );
+      }
+      return { path, size: metadata.size };
+    } catch (error) {
+      if (errno(error, "ENOENT")) {
+        throw new BackendError(
+          "Composition template asset not found.",
+          404,
+          "TEMPLATE_ASSET_NOT_FOUND",
+        );
+      }
+      throw error;
+    }
+  }
+
+  async uploadAsset(ownerId: string, templateId: string, bytes: Buffer) {
+    const normalizedOwnerId = validateOwnerId(ownerId);
+    const normalizedTemplateId = validateTemplateId(templateId);
+    return this.serialize(normalizedOwnerId, async () => {
+      await this.get(normalizedOwnerId, normalizedTemplateId);
+      const normalized = await this.media.normalizeUploadedImage(bytes);
+      const usage = await this.assetUsage(normalizedOwnerId, normalizedTemplateId);
+      if (usage.files >= this.maxAssetFiles) {
+        throw new BackendError(
+          `A composition template can have at most ${this.maxAssetFiles} image assets.`,
+          409,
+          "TEMPLATE_ASSET_LIMIT_REACHED",
+        );
+      }
+      if (usage.bytes + normalized.data.byteLength > this.maxAssetBytes) {
+        throw new BackendError(
+          "The images in this composition template are too large.",
+          413,
+          "TEMPLATE_ASSETS_TOO_LARGE",
+        );
+      }
+      const assetId = validateTemplateId(this.createAssetId());
+      const path = this.assetPath(normalizedOwnerId, normalizedTemplateId, assetId);
+      try {
+        await writeFile(path, normalized.data, { flag: "wx", mode: 0o600 });
+      } catch (error) {
+        if (errno(error, "EEXIST")) {
+          throw new BackendError(
+            "The composition template asset already exists.",
+            409,
+            "TEMPLATE_ASSET_EXISTS",
+          );
+        }
+        throw error;
+      }
+      return {
+        assetId,
+        url: templateAssetUrl(normalizedTemplateId, assetId),
+        width: normalized.info.width,
+        height: normalized.info.height,
+      };
+    });
+  }
+
+  async deleteAsset(ownerId: string, templateId: string, assetId: string) {
+    const normalizedOwnerId = validateOwnerId(ownerId);
+    const normalizedTemplateId = validateTemplateId(templateId);
+    const normalizedAssetId = validateTemplateId(assetId);
+    return this.serialize(normalizedOwnerId, async () => {
+      const current = await this.get(normalizedOwnerId, normalizedTemplateId);
+      const referenced = current.layers.some((layer) =>
+        layer.type === "image" &&
+        layer.source.kind === "asset" &&
+        layer.source.assetId === normalizedAssetId
+      );
+      if (referenced) {
+        throw new BackendError(
+          "A template asset that is in use cannot be deleted.",
+          409,
+          "TEMPLATE_ASSET_IN_USE",
+        );
+      }
+      const path = this.assetPath(normalizedOwnerId, normalizedTemplateId, normalizedAssetId);
+      try {
+        const metadata = await lstat(path);
+        if (!metadata.isFile() || metadata.isSymbolicLink()) {
+          throw new BackendError(
+            "The composition template asset is invalid.",
+            500,
+            "CORRUPT_TEMPLATE_ASSET",
+          );
+        }
+        await rm(path);
+      } catch (error) {
+        if (errno(error, "ENOENT")) {
+          throw new BackendError(
+            "Composition template asset not found.",
+            404,
+            "TEMPLATE_ASSET_NOT_FOUND",
+          );
+        }
+        throw error;
+      }
+      return true;
+    });
+  }
+
+  async update(
+    ownerId: string,
+    templateId: string,
+    input: { name?: unknown; layers?: unknown; expectedUpdatedAt: unknown },
+  ) {
+    const normalizedOwnerId = validateOwnerId(ownerId);
+    const normalizedTemplateId = validateTemplateId(templateId);
+    if (typeof input.expectedUpdatedAt !== "string") {
+      throw new BackendError(
+        "The current template version is required when updating.",
+        428,
+        "TEMPLATE_VERSION_REQUIRED",
+      );
+    }
+    return this.serialize(normalizedOwnerId, async () => {
+      const current = await this.get(normalizedOwnerId, normalizedTemplateId);
+      if (input.expectedUpdatedAt !== current.updatedAt) {
+        throw new BackendError(
+          "This composition template changed in another session. Refresh and try again.",
+          409,
+          "TEMPLATE_CONFLICT",
+        );
+      }
+      const name = input.name === undefined ? current.name : normalizeTemplateName(input.name);
+      const layers = input.layers === undefined
+        ? current.layers
+        : editableTemplateLayers(input.layers, normalizedTemplateId);
+      const keep = await this.verifyAssets(
+        normalizedOwnerId,
+        normalizedTemplateId,
+        layers,
+      );
+      const unchanged = name === current.name && JSON.stringify(layers) === JSON.stringify(current.layers);
+      if (unchanged) {
+        await this.pruneAssets(normalizedOwnerId, normalizedTemplateId, keep).catch(() => undefined);
+        return detail(current);
+      }
+      const updated = await this.atomicWrite(normalizedOwnerId, {
+        ...current,
+        name,
+        layers,
+        updatedAt: this.nextTimestamp(current.updatedAt),
+      });
+      await this.pruneAssets(normalizedOwnerId, normalizedTemplateId, keep).catch(() => undefined);
+      return detail(updated);
+    });
   }
 
   async capture(input: {
@@ -488,7 +817,7 @@ export class CompositionTemplateService {
             assetId = validateTemplateId(this.createAssetId());
             const source = await this.media.resolveFile(parsed.relativePath);
             totalAssetBytes += source.size;
-            if (totalAssetBytes > MAX_TEMPLATE_ASSET_BYTES) {
+            if (totalAssetBytes > this.maxAssetBytes) {
               throw new BackendError(
                 "The images in this composition are too large to save as one template.",
                 413,
@@ -615,7 +944,7 @@ export class CompositionTemplateService {
                 !metadata.isFile() ||
                 metadata.isSymbolicLink() ||
                 metadata.size <= 0 ||
-                totalAssetBytes > MAX_TEMPLATE_ASSET_BYTES
+                totalAssetBytes > this.maxAssetBytes
               ) {
                 throw new Error("Invalid template asset.");
               }

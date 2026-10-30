@@ -24,11 +24,16 @@ The API intentionally has no separate user-authentication layer. Keep it on loop
   image is center-cropped/resized to a 1080 × 1080 PNG and returned as a completed image job
 - `POST /api/generations/video` with `{ projectId, prompt, imageRequestId, duration, resolution, cameraFixed }`
 - `GET /api/generations/:requestId`
-- `GET|POST /api/composition-templates` to list or capture the current project layer stack
-- `PATCH|DELETE /api/composition-templates/:templateId` to rename or delete an account template
+- `GET|POST /api/composition-templates` to list summaries or capture the current project layer stack
+- `GET|PATCH|DELETE /api/composition-templates/:templateId` to read, optimistically update, or delete an account template; PATCH accepts `{ name?, layers?, expectedTemplateUpdatedAt }`
+- `POST /api/composition-templates/:templateId/assets` with multipart `image` to add an editable template image
+- `GET|HEAD|DELETE /api/composition-templates/:templateId/assets/:assetId` to serve a template PNG or discard an unreferenced upload
 - `POST /api/projects/:projectId/composition/apply-template` to copy and apply a saved layer stack
 - `POST /api/render` as multipart form data with `projectId`, `videoUrl`, title placement fields, and optional `music`
 - `DELETE /api/projects/:projectId/media`
 - `GET|HEAD /media/**`, including single byte-range requests
+
+Template images are normalized to PNG and limited to 100 files and 128 MiB per template,
+including uploads not yet referenced by a saved layer stack.
 
 Generation IDs are opaque `gen-image-<uuid>` or `gen-video-<uuid>` IDs. JSON job records live under `BACKEND_DATA_DIR/jobs`; generated and rendered files live under `BACKEND_DATA_DIR/media`. Writes use a same-directory temporary file followed by rename.

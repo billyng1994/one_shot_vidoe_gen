@@ -6,6 +6,9 @@ export const MAX_COMPOSITION_LAYERS = 20;
 export const MIN_IMAGE_ASPECT_RATIO = 0.01;
 export const MAX_IMAGE_ASPECT_RATIO = 100;
 export const MIN_IMAGE_LAYER_WIDTH = 0.01;
+export const MIN_BACKGROUND_ASPECT_RATIO = 0.2;
+export const MAX_BACKGROUND_ASPECT_RATIO = 3.2;
+export const MAX_BACKGROUND_LAYER_WIDTH = 4;
 
 export const FONT_FAMILIES = {
   sans: '"Liberation Sans", Arial, "Noto Sans CJK TC", "PingFang TC", sans-serif',
@@ -46,7 +49,7 @@ export type TextLayer = {
 export type ImageLayer = {
   id: string;
   type: "image";
-  role: "logo" | "overlay";
+  role: "background" | "logo" | "overlay";
   name: string;
   src: string;
   x: number;
@@ -77,6 +80,49 @@ export function createDefaultLogoLayer(): ImageLayer {
     width: BRAND_LOGO_RECT.width / OUTPUT_SIZE.width,
     aspectRatio: BRAND_LOGO_RECT.width / BRAND_LOGO_RECT.height,
     mask: "none",
+  };
+}
+
+export function backgroundCoverWidth(aspectRatio: number) {
+  return Math.max(
+    1,
+    clampNumber(
+      aspectRatio,
+      MIN_BACKGROUND_ASPECT_RATIO,
+      MAX_BACKGROUND_ASPECT_RATIO,
+    )
+      * OUTPUT_SIZE.height / OUTPUT_SIZE.width,
+  );
+}
+
+export function createBackgroundLayer(
+  src: string,
+  aspectRatio: number,
+  name = "Background photo",
+): ImageLayer {
+  const normalizedAspectRatio = clampNumber(
+    aspectRatio,
+    MIN_BACKGROUND_ASPECT_RATIO,
+    MAX_BACKGROUND_ASPECT_RATIO,
+  );
+  const width = backgroundCoverWidth(normalizedAspectRatio);
+  const layer: ImageLayer = {
+    id: "background-photo",
+    type: "image",
+    role: "background",
+    name,
+    src,
+    x: 0,
+    y: 0,
+    width,
+    aspectRatio: normalizedAspectRatio,
+    mask: "none",
+  };
+  const height = imageLayerHeight(layer);
+  return {
+    ...layer,
+    x: (1 - width) / 2,
+    y: (1 - height) / 2,
   };
 }
 
@@ -144,10 +190,49 @@ export function imageLayerHeight(layer: ImageLayer) {
       );
 }
 
-export function maximumImageLayerWidth(layer: Pick<ImageLayer, "aspectRatio" | "mask">) {
+type ImageLayerGeometry = Pick<ImageLayer, "aspectRatio" | "mask"> &
+  Partial<Pick<ImageLayer, "role">>;
+
+export function minimumImageLayerWidth(layer: ImageLayerGeometry) {
+  return layer.role === "background"
+    ? backgroundCoverWidth(layer.aspectRatio)
+    : MIN_IMAGE_LAYER_WIDTH;
+}
+
+export function maximumImageLayerWidth(layer: ImageLayerGeometry) {
+  if (layer.role === "background") {
+    const aspectRatio = clampNumber(
+      layer.aspectRatio,
+      MIN_BACKGROUND_ASPECT_RATIO,
+      MAX_BACKGROUND_ASPECT_RATIO,
+    );
+    return Math.min(
+      backgroundCoverWidth(aspectRatio) * 3,
+      MAX_BACKGROUND_LAYER_WIDTH,
+      5 * aspectRatio,
+    );
+  }
   return layer.mask === "circle"
     ? 0.95
     : Math.min(0.95, 0.95 * layer.aspectRatio * OUTPUT_SIZE.height / OUTPUT_SIZE.width);
+}
+
+export function imageLayerPositionBounds(layer: ImageLayer) {
+  const height = imageLayerHeight(layer);
+  if (layer.role === "background") {
+    return {
+      minimumX: Math.min(0, 1 - layer.width),
+      maximumX: 0,
+      minimumY: Math.min(0, 1 - height),
+      maximumY: 0,
+    };
+  }
+  return {
+    minimumX: 0,
+    maximumX: Math.max(0, 1 - layer.width),
+    minimumY: 0,
+    maximumY: Math.max(0, 1 - height),
+  };
 }
 
 export function textLayerHeight(layer: TextLayer) {
@@ -162,6 +247,14 @@ export function layerHeight(layer: CompositionLayer) {
 }
 
 export function positionLayer<T extends CompositionLayer>(layer: T, x: number, y: number): T {
+  if (layer.type === "image") {
+    const bounds = imageLayerPositionBounds(layer);
+    return {
+      ...layer,
+      x: clampNumber(x, bounds.minimumX, bounds.maximumX),
+      y: clampNumber(y, bounds.minimumY, bounds.maximumY),
+    };
+  }
   return {
     ...layer,
     x: clampNumber(x, 0, Math.max(0, 1 - layer.width)),
@@ -175,14 +268,44 @@ export function reorderLayersForVisualDrop(
   targetId: string,
 ) {
   if (sourceId === targetId) return [...layers];
-  const visualLayers = [...layers].reverse();
+  const background = layers.find(
+    (layer) => layer.type === "image" && layer.role === "background",
+  );
+  if (sourceId === background?.id || targetId === background?.id) return [...layers];
+  const movableLayers = background
+    ? layers.filter((layer) => layer !== background)
+    : [...layers];
+  const visualLayers = [...movableLayers].reverse();
   const sourceIndex = visualLayers.findIndex(({ id }) => id === sourceId);
   const targetIndex = visualLayers.findIndex(({ id }) => id === targetId);
   if (sourceIndex < 0 || targetIndex < 0) return [...layers];
   const [moved] = visualLayers.splice(sourceIndex, 1);
   if (!moved) return [...layers];
   visualLayers.splice(targetIndex, 0, moved);
-  return visualLayers.reverse();
+  const reordered = visualLayers.reverse();
+  return background ? [background, ...reordered] : reordered;
+}
+
+export function moveLayerOneStep(
+  layers: readonly CompositionLayer[],
+  layerId: string,
+  direction: "forward" | "backward",
+) {
+  const background = layers.find(
+    (layer) => layer.type === "image" && layer.role === "background",
+  );
+  if (layerId === background?.id) return [...layers];
+  const movableLayers = background
+    ? layers.filter((layer) => layer !== background)
+    : [...layers];
+  const currentIndex = movableLayers.findIndex(({ id }) => id === layerId);
+  const targetIndex = currentIndex + (direction === "forward" ? 1 : -1);
+  if (currentIndex < 0 || targetIndex < 0 || targetIndex >= movableLayers.length) {
+    return [...layers];
+  }
+  const next = [...movableLayers];
+  [next[currentIndex], next[targetIndex]] = [next[targetIndex]!, next[currentIndex]!];
+  return background ? [background, ...next] : next;
 }
 
 export function escapeXml(value: string) {

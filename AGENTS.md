@@ -7,3 +7,12 @@ This version has breaking changes — APIs, conventions, and file structure may 
 This block is written and re-added by `next dev` — verify at `node_modules/next/dist/server/lib/generate-agent-files.js`. Removing it from a diff only re-creates the uncommitted change; committing it with your work keeps the tree clean.
 
 <!-- END:nextjs-agent-rules -->
+
+## Lessons Learned Index
+
+- **Composition rendering** — Shared background geometry, layer ordering, and preview/render parity.
+  See `lesson_learn/composition_rendering.md`.
+- **Template persistence** — Portable private assets, atomic optimistic edits, cleanup, and quotas.
+  See `lesson_learn/template_persistence.md`.
+- **Testing and workflow** — Cross-surface browser coverage, local artifact handling, and Next.js
+  validation practices. See `lesson_learn/testing_workflow.md`.

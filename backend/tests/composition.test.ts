@@ -8,6 +8,7 @@ import {
   validateCompositionLayers,
   wrapTitle,
   type CompositionLayer,
+  type ImageLayer,
   type TextLayer,
 } from "../src/composition.js";
 
@@ -36,6 +37,111 @@ function textLayer(overrides: Partial<TextLayer> = {}): TextLayer {
 }
 
 describe("composition layer contract", () => {
+  it("accepts one backmost full-canvas background image", () => {
+    const background: ImageLayer = {
+      id: "background-1",
+      type: "image",
+      role: "background",
+      name: "Background",
+      src: `/media/${PROJECT_ID}/images/overlay-${UPLOAD_ID}.png`,
+      x: 0,
+      y: 0,
+      width: 1,
+      aspectRatio: 0.8,
+      mask: "none",
+    };
+
+    expect(validateCompositionLayers(
+      [background, ...defaultCompositionLayers()],
+      { projectId: PROJECT_ID },
+    )[0]).toEqual(background);
+  });
+
+  it("lets a background zoom and crop while requiring it to cover the canvas", () => {
+    const background: ImageLayer = {
+      id: "background-zoomed",
+      type: "image",
+      role: "background",
+      name: "Zoomed background",
+      src: `/media/${PROJECT_ID}/images/overlay-${UPLOAD_ID}.png`,
+      x: -0.75,
+      y: -0.1,
+      width: 2.25,
+      aspectRatio: 1.5,
+      mask: "none",
+    };
+
+    expect(validateCompositionLayers(
+      [background, ...defaultCompositionLayers()],
+      { projectId: PROJECT_ID },
+    )[0]).toEqual(background);
+    expect(() => validateCompositionLayers(
+      [{ ...background, x: 0, y: 0, width: 1.8 }, ...defaultCompositionLayers()],
+      { projectId: PROJECT_ID },
+    )).toThrow(/cover the canvas/);
+  });
+
+  it("bounds background aspect ratio and zoom to safe render dimensions", () => {
+    const background: ImageLayer = {
+      id: "background-bounded",
+      type: "image",
+      role: "background",
+      name: "Bounded background",
+      src: `/media/${PROJECT_ID}/images/overlay-${UPLOAD_ID}.png`,
+      x: -3,
+      y: 0,
+      width: 4,
+      aspectRatio: 3.2,
+      mask: "none",
+    };
+
+    expect(validateCompositionLayers(
+      [background, ...defaultCompositionLayers()],
+      { projectId: PROJECT_ID },
+    )[0]).toEqual(background);
+    expect(() => validateCompositionLayers(
+      [{ ...background, x: 0, width: 1, aspectRatio: 0.1 }, ...defaultCompositionLayers()],
+      { projectId: PROJECT_ID },
+    )).toThrow(/aspect ratio/);
+    expect(() => validateCompositionLayers(
+      [{ ...background, x: -3.01, width: 4.01 }, ...defaultCompositionLayers()],
+      { projectId: PROJECT_ID },
+    )).toThrow(/width/);
+  });
+
+  it("requires a single unmasked background to be the backmost layer", () => {
+    const background: ImageLayer = {
+      id: "background-1",
+      type: "image",
+      role: "background",
+      name: "Background",
+      src: `/media/${PROJECT_ID}/images/overlay-${UPLOAD_ID}.png`,
+      x: 0,
+      y: 0,
+      width: 1,
+      aspectRatio: 0.8,
+      mask: "none",
+    };
+    const defaults = defaultCompositionLayers();
+
+    expect(() => validateCompositionLayers(
+      [defaults[0], background, defaults[1]],
+      { projectId: PROJECT_ID },
+    )).toThrow(/backmost/);
+    expect(() => validateCompositionLayers(
+      [background, { ...background, id: "background-2" }, ...defaults],
+      { projectId: PROJECT_ID },
+    )).toThrow(/at most one background/);
+    expect(() => validateCompositionLayers(
+      [{ ...background, mask: "circle" }, ...defaults],
+      { projectId: PROJECT_ID },
+    )).toThrow(/background.*mask/i);
+    expect(() => validateCompositionLayers([
+      { ...background, src: "/gostudy-logo.svg" },
+      ...defaults,
+    ])).toThrow(/built-in logo/);
+  });
+
   it("validates JSON documents and preserves bottom-to-top order", () => {
     const layers: CompositionLayer[] = [
       ...defaultCompositionLayers(),

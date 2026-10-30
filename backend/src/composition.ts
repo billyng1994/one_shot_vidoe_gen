@@ -48,7 +48,7 @@ export type TextLayer = LayerBase & {
 
 export type ImageLayer = LayerBase & {
   type: "image";
-  role: "logo" | "overlay";
+  role: "background" | "logo" | "overlay";
   src: string;
   aspectRatio: number;
   mask: ImageMask;
@@ -203,26 +203,44 @@ export function validateCompositionLayers(
     }
 
     if (layer.type === "image") {
-      if (layer.role !== "logo" && layer.role !== "overlay") {
+      if (layer.role !== "background" && layer.role !== "logo" && layer.role !== "overlay") {
         invalid("An image layer has an invalid role.", code);
       }
       if (!(IMAGE_MASKS as readonly unknown[]).includes(layer.mask)) {
         invalid("An image layer has an invalid mask.", code);
       }
+      if (layer.role === "background" && layer.mask !== "none") {
+        invalid("A background image cannot use a mask.", code);
+      }
+      if (layer.src === DEFAULT_LOGO_SRC && layer.role !== "logo") {
+        invalid("Only the logo layer can use the built-in logo.", code);
+      }
       const aspectRatio = finiteInRange(
         layer.aspectRatio,
-        MIN_IMAGE_ASPECT_RATIO,
-        MAX_IMAGE_ASPECT_RATIO,
+        layer.role === "background" ? 0.2 : MIN_IMAGE_ASPECT_RATIO,
+        layer.role === "background" ? 3.2 : MAX_IMAGE_ASPECT_RATIO,
         "An image layer aspect ratio",
         code,
       );
       const mask = layer.mask as ImageMask;
-      const maximumWidth = mask === "circle"
-        ? 0.95
-        : Math.min(0.95, 0.95 * aspectRatio * OUTPUT_SIZE.height / OUTPUT_SIZE.width);
+      const backgroundCoverWidth = Math.max(
+        1,
+        aspectRatio * OUTPUT_SIZE.height / OUTPUT_SIZE.width,
+      );
+      if (
+        layer.role === "background" &&
+        (typeof layer.width !== "number" || layer.width < backgroundCoverWidth)
+      ) {
+        invalid("A background image must cover the canvas.", code);
+      }
+      const maximumWidth = layer.role === "background"
+        ? Math.min(backgroundCoverWidth * 3, 4, 5 * aspectRatio)
+        : mask === "circle"
+          ? 0.95
+          : Math.min(0.95, 0.95 * aspectRatio * OUTPUT_SIZE.height / OUTPUT_SIZE.width);
       const width = finiteInRange(
         layer.width,
-        MIN_IMAGE_LAYER_WIDTH,
+        layer.role === "background" ? backgroundCoverWidth : MIN_IMAGE_LAYER_WIDTH,
         maximumWidth,
         "An image layer width",
         code,
@@ -239,6 +257,14 @@ export function validateCompositionLayers(
         aspectRatio,
         mask,
       };
+      if (provisional.role === "background") {
+        const height = imageLayerHeight(provisional);
+        return {
+          ...provisional,
+          x: finiteInRange(layer.x, 1 - width, 0, "A layer x position", code),
+          y: finiteInRange(layer.y, 1 - height, 0, "A layer y position", code),
+        };
+      }
       return {
         ...provisional,
         x: finiteInRange(layer.x, 0, 1 - width, "A layer x position", code),
@@ -258,6 +284,18 @@ export function validateCompositionLayers(
     (layer) => layer.type === "image" && layer.role === "logo",
   ).length;
   if (logoCount !== 1) invalid("A composition must contain exactly one logo layer.", code);
+  const backgroundCount = layers.filter(
+    (layer) => layer.type === "image" && layer.role === "background",
+  ).length;
+  if (backgroundCount > 1) {
+    invalid("A composition can contain at most one background image.", code);
+  }
+  if (
+    backgroundCount === 1 &&
+    !(layers[0]?.type === "image" && layers[0].role === "background")
+  ) {
+    invalid("A background image must be the backmost composition layer.", code);
+  }
   return layers;
 }
 
@@ -411,11 +449,13 @@ export function wrappedTextLines(
   );
 }
 
-export function createFrameSvg() {
+export function createFrameSvg(options: { transparentPanels?: boolean } = {}) {
+  const panels = options.transparentPanels
+    ? ""
+    : '<rect width="1080" height="159" fill="#ffffff"/>\n  <rect y="1231" width="1080" height="119" fill="#fffdf9"/>';
   return `
 <svg xmlns="http://www.w3.org/2000/svg" width="${OUTPUT_SIZE.width}" height="${OUTPUT_SIZE.height}" viewBox="0 0 ${OUTPUT_SIZE.width} ${OUTPUT_SIZE.height}">
-  <rect width="1080" height="159" fill="#ffffff"/>
-  <rect y="1231" width="1080" height="119" fill="#fffdf9"/>
+  ${panels}
   <rect y="157" width="1080" height="2" fill="#e9e2d9"/>
   <path d="M 0 1276 H 1035 V 236 H 914" fill="none" stroke="#ff5423" stroke-width="7" stroke-linejoin="miter"/>
 </svg>`.trim();
